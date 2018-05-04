@@ -24,6 +24,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::str;
 use util::{HashToDigest, Digest};
 
 use errors::*;
@@ -90,7 +91,7 @@ impl Language {
     pub fn from_file_name(file: &Path) -> Option<Self> {
         match file.extension().and_then(|e| e.to_str()) {
             Some("c") => Some(Language::C),
-            Some("cc") | Some("cpp") | Some("cxx") => Some(Language::Cxx),
+            Some("cc") | Some("cpp") | Some("cxx") | Some("cu") => Some(Language::Cxx),
             Some("m") => Some(Language::ObjectiveC),
             Some("mm") => Some(Language::ObjectiveCxx),
             e => {
@@ -126,6 +127,8 @@ pub enum CCompilerKind {
     Clang,
     /// Microsoft Visual C++
     MSVC,
+    /// NVCC
+    NVCC,
 }
 
 /// An interface to a specific C compiler.
@@ -237,12 +240,15 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
                    preprocessor_result.stdout.len());
 
             let key = {
+                // TODO: you can use parsed_args.input to get the input file
                 hash_key(&executable_digest,
                          parsed_args.language,
                          &parsed_args.common_args,
                          &env_vars,
                          &preprocessor_result.stdout)
             };
+            debug!("hash key: {}", key);
+            debug!("input file: {:?}", parsed_args.input);
             Ok(HashResult {
                 key: key,
                 compilation: Box::new(CCompilation {
@@ -322,6 +328,15 @@ pub fn hash_key(compiler_digest: &str,
         }
     }
     m.update(preprocessor_output);
+
+    // debug!("IN HASH KEY: compiler_digest: {}", compiler_digest);
+    // debug!("IN HASH KEY: CACHE_VERSION: {:?}", CACHE_VERSION);
+    // debug!("IN HASH KEY: language: {}", language.as_str());
+    // for arg in arguments {
+    //     debug!("IN HASH KEY: arg: {:?}", arg);
+    // }
+    // debug!("IN HASH KEY: preprocessor_output: {}", str::from_utf8(preprocessor_output).unwrap());
+
     m.finish()
 }
 

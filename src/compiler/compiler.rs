@@ -21,6 +21,7 @@ use compiler::msvc;
 use compiler::c::{CCompiler, CCompilerKind};
 use compiler::clang::Clang;
 use compiler::gcc::GCC;
+use compiler::nvcc::NVCC;
 use compiler::msvc::MSVC;
 use compiler::rust::Rust;
 use futures::{Future, IntoFuture};
@@ -529,7 +530,15 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
 {
     trace!("detect_c_compiler");
 
-    let test = b"#if defined(_MSC_VER)
+    // The detection script doesn't work with NVCC, have to assume NVCC executable name contains "nvcc" instead.
+    let executable_str = executable.clone().into_os_string().into_string().unwrap();
+    debug!("executable: {}", executable_str);
+    if executable_str.contains("nvcc") {
+        debug!("Found NVCC");
+        return Box::new(CCompiler::new(NVCC, executable, &pool)
+                        .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+    } else {
+        let test = b"#if defined(_MSC_VER)
 msvc
 #elif defined(__clang__)
 clang
@@ -537,54 +546,55 @@ clang
 gcc
 #endif
 ".to_vec();
-    let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
+        let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
 
-    let mut cmd = creator.clone().new_command_sync(&executable);
-    cmd.stdout(Stdio::piped())
-       .stderr(Stdio::null());
-    let output = write.and_then(move |(tempdir, src)| {
-        cmd.arg("-E").arg(src);
-        trace!("compiler {:?}", cmd);
-        cmd.spawn().and_then(|child| {
-            child.wait_with_output().chain_err(|| "failed to read child output")
-        }).map(|e| {
-            drop(tempdir);
-            e
-        })
-    });
+        let mut cmd = creator.clone().new_command_sync(&executable);
+        cmd.stdout(Stdio::piped())
+           .stderr(Stdio::null());
+        let output = write.and_then(move |(tempdir, src)| {
+            cmd.arg("-E").arg(src);
+            trace!("compiler {:?}", cmd);
+            cmd.spawn().and_then(|child| {
+                child.wait_with_output().chain_err(|| "failed to read child output")
+            }).map(|e| {
+                drop(tempdir);
+                e
+            })
+        });
 
-    Box::new(output.and_then(move |output| -> SFuture<_> {
-        let stdout = match str::from_utf8(&output.stdout) {
-            Ok(s) => s,
-            Err(_) => return f_err("Failed to parse output"),
-        };
-        for line in stdout.lines() {
-            //TODO: do something smarter here.
-            if line == "gcc" {
-                debug!("Found GCC");
-                return Box::new(CCompiler::new(GCC, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
-            } else if line == "clang" {
-                debug!("Found clang");
-                return Box::new(CCompiler::new(Clang, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
-            } else if line == "msvc" {
-                debug!("Found MSVC");
-                let prefix = msvc::detect_showincludes_prefix(&creator,
-                                                              executable.as_ref(),
-                                                              &pool);
-                return Box::new(prefix.and_then(move |prefix| {
-                    trace!("showIncludes prefix: '{}'", prefix);
-                    CCompiler::new(MSVC {
-                        includes_prefix: prefix,
-                    }, executable, &pool)
-                        .map(|c| Some(Box::new(c) as Box<Compiler<T>>))
-                }))
+        Box::new(output.and_then(move |output| -> SFuture<_> {
+            let stdout = match str::from_utf8(&output.stdout) {
+                Ok(s) => s,
+                Err(_) => return f_err("Failed to parse output"),
+            };
+            for line in stdout.lines() {
+                //TODO: do something smarter here.
+                if line == "gcc" {
+                    debug!("Found GCC");
+                    return Box::new(CCompiler::new(GCC, executable, &pool)
+                                    .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+                } else if line == "clang" {
+                    debug!("Found clang");
+                    return Box::new(CCompiler::new(Clang, executable, &pool)
+                                    .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+                } else if line == "msvc" {
+                    debug!("Found MSVC");
+                    let prefix = msvc::detect_showincludes_prefix(&creator,
+                                                                  executable.as_ref(),
+                                                                  &pool);
+                    return Box::new(prefix.and_then(move |prefix| {
+                        trace!("showIncludes prefix: '{}'", prefix);
+                        CCompiler::new(MSVC {
+                            includes_prefix: prefix,
+                        }, executable, &pool)
+                            .map(|c| Some(Box::new(c) as Box<Compiler<T>>))
+                    }))
+                }
             }
-        }
-        debug!("nothing useful in detection output {:?}", stdout);
-        f_ok(None)
-    }))
+            debug!("nothing useful in detection output {:?}", stdout);
+            f_ok(None)
+        }))
+    }
 }
 
 /// If `executable` is a known compiler, return a `Box<Compiler>` containing information about it.

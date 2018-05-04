@@ -169,6 +169,7 @@ where
 {
     let mut output_arg = None;
     let mut input_arg = None;
+    let mut input_arg_val = String::from("");
     let mut dep_target = None;
     let mut common_args = vec!();
     let mut preprocessor_args = vec!();
@@ -220,10 +221,19 @@ where
             None => {
                 match item.arg {
                     Argument::Raw(ref val) => {
-                        if input_arg.is_some() {
-                            multiple_input = true;
-                        }
-                        input_arg = Some(val.clone());
+                        debug!("multiple input check: input_arg: {:?}", val);
+                        language = Language::from_file_name(Path::new(&val));
+                        let _language = match language {
+                            Some(_l) => {
+                                debug!("multiple input check: {:?} is valid input file", val);
+                                if input_arg.is_some() {
+                                    multiple_input = true;
+                                }
+                                input_arg_val = val.clone().into_string().unwrap();
+                                input_arg = Some(val.clone());
+                            },
+                            None => {}
+                        };
                     }
                     Argument::UnknownFlag(_) => {}
                     _ => unreachable!(),
@@ -242,7 +252,13 @@ where
             Some(TooHard) => unreachable!(),
             None => {
                 match item.arg {
-                    Argument::Raw(_) => None,
+                    Argument::Raw(ref val) => {
+                        if val.clone().into_string().unwrap() != input_arg_val {
+                            Some(&mut common_args)
+                        } else {
+                            None
+                        }
+                    }
                     Argument::UnknownFlag(_) => Some(&mut common_args),
                     _ => unreachable!(),
                 }
