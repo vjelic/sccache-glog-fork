@@ -461,14 +461,17 @@ where
         if let Some(arg) = self.arguments.next() {
             let s = arg.to_string_lossy();
             let arguments = &mut self.arguments;
+            eprintln!("&s[..]: {:?}", &s[..]);
             match self.arg_info.search(&s[..]) {
                 Some(ref i) => {
+                    eprintln("for s: {:?}, found match in arg_info", s);
                     Some(ArgumentItem {
                         arg: i.get_arg_info().process(&s[..], || arguments.next()),
                         data: Some(i.get_extra()),
                     })
                 }
                 None => {
+                    eprintln("for s: {:?}, no match in arg_info", s);
                     Some(ArgumentItem {
                         arg: if s.starts_with("-") {
                             Argument::UnknownFlag(arg.clone())
