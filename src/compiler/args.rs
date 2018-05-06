@@ -205,8 +205,10 @@ impl ArgInfo {
             ArgInfo::TakeArg(s, t, ArgDisposition::Separated) => {
                 debug_assert_eq!(s, arg);
                 if let Some(a) = get_next_arg() {
+                    eprintln!("this arg: {:?}, get_next_arg: {:?}", arg, a);
                     Argument::WithValue(s, t.process(a), ArgDisposition::Separated)
                 } else {
+                    eprintln!("this arg: {:?}, no get_next_arg", arg);
                     Argument::Flag(s)
                 }
             }
