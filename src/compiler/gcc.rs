@@ -221,11 +221,11 @@ where
             None => {
                 match item.arg {
                     Argument::Raw(ref val) => {
-                        debug!("multiple input check: input_arg: {:?}", val);
+                        eprintln!("[DEBUG] multiple input check: input_arg: {:?}", val);
                         language = Language::from_file_name(Path::new(&val));
                         let _language = match language {
                             Some(_l) => {
-                                debug!("multiple input check: {:?} is valid input file", val);
+                                eprintln!("[DEBUG] multiple input check: {:?} is valid input file", val);
                                 if input_arg.is_some() {
                                     multiple_input = true;
                                 }

@@ -507,21 +507,21 @@ impl<C> SccacheService<C>
                 // the provided commandline.
                 match c.parse_arguments(&cmd, &cwd) {
                     CompilerArguments::Ok(hasher) => {
-                        debug!("parse_arguments: Ok: {:?}", cmd);
+                        eprintln!("[DEBUG] parse_arguments: Ok: {:?}", cmd);
                         stats.requests_executed += 1;
                         let (tx, rx) = Body::pair();
-                        debug!("check_compiler: compiler hash: {:?}, compiler kind: {:?}", hasher.output_pretty().into_owned(), c.kind());
+                        eprintln!("[DEBUG] check_compiler: compiler hash: {:?}, compiler kind: {:?}", hasher.output_pretty().into_owned(), c.kind());
                         self.start_compile_task(hasher, cmd, cwd, env_vars, tx);
                         let res = CompileResponse::CompileStarted;
                         return Message::WithBody(Response::Compile(res), rx)
                     }
                     CompilerArguments::CannotCache(why) => {
                         //TODO: save counts of why
-                        debug!("parse_arguments: CannotCache({}): {:?}", why, cmd);
+                        eprintln!("parse_arguments: CannotCache({}): {:?}", why, cmd);
                         stats.requests_not_cacheable += 1;
                     }
                     CompilerArguments::NotCompilation => {
-                        debug!("parse_arguments: NotCompilation: {:?}", cmd);
+                        eprintln!("parse_arguments: NotCompilation: {:?}", cmd);
                         stats.requests_not_compile += 1;
                     }
                 }
@@ -576,7 +576,7 @@ impl<C> SccacheService<C>
                             stats.cache_errors += 1;
                         }
                         CompileResult::CacheHit(duration) => {
-                            debug!("Cache hit: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
+                            eprintln!("[DEBUG] Cache hit: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
                             stats.cache_hits += 1;
                             stats.cache_read_hit_duration += duration;
                         },
@@ -593,13 +593,14 @@ impl<C> SccacheService<C>
                                     stats.cache_errors += 1;
                                 }
                             }
-                            debug!("Cache miss: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
+                            eprintln!("[DEBUG] Cache miss: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
                             stats.cache_misses += 1;
                             stats.cache_read_miss_duration += duration;
                             cache_write = Some(future);
                         }
                         CompileResult::NotCacheable => {
                             stats.cache_misses += 1;
+                            eprintln!("CompileResult::NotCacheable: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
                             stats.non_cacheable_compilations += 1;
                         }
                         CompileResult::CompileFailed => {
@@ -648,12 +649,12 @@ impl<C> SccacheService<C>
             let cache_write = cache_write.then(move |result| {
                 match result {
                     Err(e) => {
-                        debug!("Error executing cache write: {}", e);
+                        eprintln!("Error executing cache write: {}", e);
                         me.stats.borrow_mut().cache_write_errors += 1;
                     }
                     //TODO: save cache stats!
                     Ok(Some(info)) => {
-                        debug!("[{}]: Cache write finished in {}",
+                        eprintln!("[{}]: Cache write finished in {}",
                                info.object_file_pretty,
                                fmt_duration_as_secs(&info.duration));
                         me.stats.borrow_mut().cache_writes += 1;

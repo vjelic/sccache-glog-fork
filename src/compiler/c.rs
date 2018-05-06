@@ -89,7 +89,10 @@ impl ParsedArguments {
 
 impl Language {
     pub fn from_file_name(file: &Path) -> Option<Self> {
-        match file.extension().and_then(|e| e.to_str()) {
+        // Remove quotes and trailing whitespaces
+        let path = file.to_str().unwrap().replace("\"", "");
+        let path = path.trim_right();
+        match Path::new(&path).extension().and_then(|e| e.to_str()) {
             Some("c") => Some(Language::C),
             Some("cc") | Some("cpp") | Some("cxx") | Some("cu") => Some(Language::Cxx),
             Some("m") => Some(Language::ObjectiveC),
@@ -247,8 +250,8 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
                          &env_vars,
                          &preprocessor_result.stdout)
             };
-            debug!("hash key: {}", key);
-            debug!("input file: {:?}", parsed_args.input);
+            eprintln!("[DEBUG] hash key: {}", key);
+            eprintln!("[DEBUG] input file: {:?}", parsed_args.input);
             Ok(HashResult {
                 key: key,
                 compilation: Box::new(CCompilation {
@@ -329,13 +332,13 @@ pub fn hash_key(compiler_digest: &str,
     }
     m.update(preprocessor_output);
 
-    // debug!("IN HASH KEY: compiler_digest: {}", compiler_digest);
-    // debug!("IN HASH KEY: CACHE_VERSION: {:?}", CACHE_VERSION);
-    // debug!("IN HASH KEY: language: {}", language.as_str());
+    // eprintln!("[DEBUG] IN HASH KEY: compiler_digest: {}", compiler_digest);
+    // eprintln!("[DEBUG] IN HASH KEY: CACHE_VERSION: {:?}", CACHE_VERSION);
+    // eprintln!("[DEBUG] IN HASH KEY: language: {}", language.as_str());
     // for arg in arguments {
-    //     debug!("IN HASH KEY: arg: {:?}", arg);
+    //     eprintln!("[DEBUG] IN HASH KEY: arg: {:?}", arg);
     // }
-    // debug!("IN HASH KEY: preprocessor_output: {}", str::from_utf8(preprocessor_output).unwrap());
+    // eprintln!("[DEBUG] IN HASH KEY: preprocessor_output: {}", str::from_utf8(preprocessor_output).unwrap());
 
     m.finish()
 }

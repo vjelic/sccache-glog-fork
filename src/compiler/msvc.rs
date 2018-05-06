@@ -30,6 +30,7 @@ use mock_command::{
 use std::collections::{HashMap,HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
+use std::io::Read;
 use std::io::{
     self,
     BufWriter,
@@ -38,6 +39,7 @@ use std::io::{
 use std::path::{Path, PathBuf};
 use std::process::{self,Stdio};
 use util::{run_input_output, OsStrExt};
+use std::usize;
 
 use errors::*;
 
@@ -198,7 +200,7 @@ enum MSVCArgAttribute {
 
 use self::MSVCArgAttribute::*;
 
-static ARGS: [(ArgInfo, MSVCArgAttribute); 20] = [
+static ARGS: [(ArgInfo, MSVCArgAttribute); 19] = [
     take_arg!("-D", String, Concatenated, PreprocessorArgument),
     take_arg!("-FA", String, Concatenated, TooHard),
     take_arg!("-FI", Path, CanBeSeparated, PreprocessorArgument),
@@ -218,7 +220,6 @@ static ARGS: [(ArgInfo, MSVCArgAttribute); 20] = [
     flag!("-c", DoCompilation),
     take_arg!("-deps", Path, Concatenated, DepFile),
     flag!("-showIncludes", ShowIncludes),
-    take_arg!("@", Path, Concatenated, TooHard),
 ];
 
 pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArguments> {
@@ -230,9 +231,16 @@ pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArgume
     let mut pdb = None;
     let mut depfile = None;
     let mut show_includes = false;
+    let mut multiple_input = false;
 
-    // First convert all `/foo` arguments to `-foo` to accept both styles
-    let it = arguments.iter().map(|i| {
+    // Custom iterator to expand `@` arguments which stand for reading a file
+    // and interpreting it as a list of more arguments.
+    let it = ExpandIncludeFile {
+        stack: arguments.iter().rev().map(|a| a.to_owned()).collect(),
+    };
+
+    // Convert all `/foo` arguments to `-foo` to accept both styles
+    let it = it.map(|i| {
         if let Some(arg) = i.split_prefix("/") {
             let mut dash = OsString::from("-");
             dash.push(&arg);
@@ -268,11 +276,18 @@ pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArgume
             None => {
                 match item.arg {
                     Argument::Raw(ref val) => {
-                        if input_arg.is_some() {
-                            // Can't cache compilations with multiple inputs.
-                            return CompilerArguments::CannotCache("multiple input files");
-                        }
-                        input_arg = Some(val.clone());
+                        eprintln!("[DEBUG] multiple input check: input_arg: {:?}", val);
+                        let language = Language::from_file_name(Path::new(&val));
+                        match language {
+                            Some(_l) => {
+                                eprintln!("[DEBUG] multiple input check: {:?} is valid input file", val);
+                                if input_arg.is_some() {
+                                    multiple_input = true;
+                                }
+                                input_arg = Some(val.clone());
+                            },
+                            None => common_args.push(val.clone()),
+                        };
                     }
                     Argument::UnknownFlag(ref flag) => common_args.push(flag.clone()),
                     _ => unreachable!(),
@@ -289,6 +304,10 @@ pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArgume
     // We only support compilation.
     if !compilation {
         return CompilerArguments::NotCompilation;
+    }
+    // Can't cache compilations with multiple inputs.
+    if multiple_input {
+        return CompilerArguments::CannotCache("multiple input files");
     }
     let (input, language) = match input_arg {
         Some(i) => {
@@ -322,6 +341,12 @@ pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArgume
             }
         };
     }
+
+    let common_args_clone = common_args.clone();
+    for arg in common_args_clone {
+        eprintln!("common_arg: {:?}", arg);
+    }
+
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
         language: language,
@@ -383,6 +408,11 @@ pub fn preprocess<T>(creator: &T,
                      -> SFuture<process::Output>
     where T: CommandCreatorSync
 {
+    let env_vars_clone = env_vars.clone();
+    for env_var in env_vars_clone.iter() {
+        eprintln!("env_var: {:?}", env_var);
+    }
+
     let mut cmd = creator.clone().new_command_sync(executable);
     cmd.arg("-E")
         .arg(&parsed_args.input)
@@ -458,6 +488,11 @@ fn compile<T>(creator: &T,
               -> SFuture<(Cacheable, process::Output)>
     where T: CommandCreatorSync
 {
+    let env_vars_clone = env_vars.clone();
+    for env_var in env_vars_clone.iter() {
+        eprintln!("env_var: {:?}", env_var);
+    }
+
     trace!("compile");
     let out_file = match parsed_args.outputs.get("obj") {
         Some(obj) => obj,
@@ -495,6 +530,64 @@ fn compile<T>(creator: &T,
     }))
 }
 
+struct ExpandIncludeFile {
+    stack: Vec<OsString>,
+}
+
+impl Iterator for ExpandIncludeFile {
+    type Item = OsString;
+
+    fn next(&mut self) -> Option<OsString> {
+        loop {
+            let arg = match self.stack.pop() {
+                Some(arg) => arg,
+                None => return None,
+            };
+            let file = match arg.split_prefix("@") {
+                Some(arg) => arg,
+                None => return Some(arg),
+            };
+
+            // According to gcc [1], @file means:
+            //
+            //     Read command-line options from file. The options read are
+            //     inserted in place of the original @file option. If file does
+            //     not exist, or cannot be read, then the option will be
+            //     treated literally, and not removed.
+            //
+            //     Options in file are separated by whitespace. A
+            //     whitespace character may be included in an option by
+            //     surrounding the entire option in either single or double
+            //     quotes. Any character (including a backslash) may be
+            //     included by prefixing the character to be included with
+            //     a backslash. The file may itself contain additional
+            //     @file options; any such options will be processed
+            //     recursively.
+            //
+            // So here we interpret any I/O errors as "just return this
+            // argument". Currently we don't implement handling of arguments
+            // with quotes, so if those are encountered we just pass the option
+            // through literally anyway.
+            //
+            // At this time we interpret all `@` arguments above as non
+            // cacheable, so if we fail to interpret this we'll just call the
+            // compiler anyway.
+            //
+            // [1]: https://gcc.gnu.org/onlinedocs/gcc/Overall-Options.html#Overall-Options
+            let mut contents = String::new();
+            let res = File::open(&file).and_then(|mut f| {
+                f.read_to_string(&mut contents)
+            });
+            eprintln!("arg file content: {:?}", contents);
+            if let Err(e) = res {
+                debug!("failed to read @-file `{:?}`: {}", file, e);
+                return Some(arg)
+            }
+            let new_args = contents.split_whitespace().collect::<Vec<_>>();
+            self.stack.extend(new_args.iter().rev().map(|s| s.into()));
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {

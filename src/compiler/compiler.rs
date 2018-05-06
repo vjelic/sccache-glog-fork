@@ -113,7 +113,7 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
                              -> SFuture<(CompileResult, process::Output)>
     {
         let out_pretty = self.output_pretty().into_owned();
-        debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
+        eprintln!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
         let start = Instant::now();
         let result = self.generate_hash_key(&creator, &cwd, &env_vars, &pool);
         Box::new(result.then(move |res| -> SFuture<_> {
@@ -532,7 +532,7 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
 
     // The detection script doesn't work with NVCC, have to assume NVCC executable name contains "nvcc" instead.
     let executable_str = executable.clone().into_os_string().into_string().unwrap();
-    debug!("executable: {}", executable_str);
+    eprintln!("Compiler executable: {}", executable_str);
     if executable_str.contains("nvcc") {
         debug!("Found NVCC");
         return Box::new(CCompiler::new(NVCC, executable, &pool)
