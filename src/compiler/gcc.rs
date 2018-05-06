@@ -87,7 +87,7 @@ pub enum GCCArgAttribute {
 use self::GCCArgAttribute::*;
 
 // Mostly taken from https://github.com/ccache/ccache/blob/master/compopt.c#L32-L84
-pub static ARGS: [(ArgInfo, GCCArgAttribute); 60] = [
+pub static ARGS: [(ArgInfo, GCCArgAttribute); 61] = [
     flag!("-", TooHard),
     take_arg!("--param", String, Separated, PassThrough),
     flag!("--save-temps", TooHard),
@@ -119,6 +119,7 @@ pub static ARGS: [(ArgInfo, GCCArgAttribute); 60] = [
     take_arg!("-aux-info", String, Separated, PassThrough),
     take_arg!("-b", String, Separated, PassThrough),
     flag!("-c", DoCompilation),
+    take_arg!("-ccbin", Path, Separated, PassThrough),
     flag!("-fno-working-directory", PreprocessorArgument),
     flag!("-fplugin=libcc1plugin", TooHard),
     flag!("-fprofile-use", TooHard),
