@@ -510,6 +510,7 @@ impl<C> SccacheService<C>
                         debug!("parse_arguments: Ok: {:?}", cmd);
                         stats.requests_executed += 1;
                         let (tx, rx) = Body::pair();
+                        debug!("check_compiler: compiler hash: {:?}, compiler kind: {:?}", hasher.output_pretty().into_owned(), c.kind());
                         self.start_compile_task(hasher, cmd, cwd, env_vars, tx);
                         let res = CompileResponse::CompileStarted;
                         return Message::WithBody(Response::Compile(res), rx)
@@ -548,6 +549,10 @@ impl<C> SccacheService<C>
         } else {
             CacheControl::Default
         };
+
+        let arguments_clone = arguments.clone();
+        let cwd_clone = cwd.clone();
+
         let out_pretty = hasher.output_pretty().into_owned();
         let color_mode = hasher.color_mode();
         let result = hasher.get_cached_or_compile(self.creator.clone(),
@@ -571,6 +576,7 @@ impl<C> SccacheService<C>
                             stats.cache_errors += 1;
                         }
                         CompileResult::CacheHit(duration) => {
+                            debug!("Cache hit: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
                             stats.cache_hits += 1;
                             stats.cache_read_hit_duration += duration;
                         },
@@ -587,6 +593,7 @@ impl<C> SccacheService<C>
                                     stats.cache_errors += 1;
                                 }
                             }
+                            debug!("Cache miss: ARGS: {:?}, CWD: {}", arguments_clone, cwd_clone.into_os_string().into_string().unwrap());
                             stats.cache_misses += 1;
                             stats.cache_read_miss_duration += duration;
                             cache_write = Some(future);
