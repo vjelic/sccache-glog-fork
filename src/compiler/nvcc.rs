@@ -119,6 +119,10 @@ impl CCompilerImpl for NVCC {
     }
 }
 
-pub static ARGS: [(ArgInfo, gcc::GCCArgAttribute); 1] = [
+pub static ARGS: [(ArgInfo, gcc::GCCArgAttribute); 5] = [
     take_arg!("--compiler-bindir", Path, Separated, PassThrough),
+    take_arg!("--std", String, Separated, PassThrough),
+    take_arg!("-Xcompiler", String, Separated, PassThrough),
+    take_arg!("-ccbin", Path, Separated, PassThrough),
+    take_arg!("-gencode", String, Separated, PassThrough),
 ];
