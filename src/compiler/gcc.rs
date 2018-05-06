@@ -205,7 +205,9 @@ where
             Some(NeedDepTarget) => need_explicit_dep_target = true,
             Some(DepTarget) => dep_target = item.arg.get_value().map(OsString::from),
             Some(PreprocessorArgument) |
-            Some(PassThrough) => {}
+            Some(PassThrough) => {
+                eprintln!("item.arg.get_value(): {:?}", item.arg.get_value());
+            }
             Some(Language) => {
                 let lang = item.arg.get_value().map(OsString::from);
                 let lang = lang.as_ref().map(|a| a.to_string_lossy());
