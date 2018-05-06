@@ -188,6 +188,9 @@ where
     for item in ArgsIter::new(it, arg_info) {
         // Refuse to cache arguments such as "-include@foo" because they're a
         // mess. See https://github.com/mozilla/sccache/issues/150#issuecomment-318586953
+        if let Argument::WithValue(ref v1, ref v2, _) = item.arg {
+            eprintln!("Argument::WithValue: v1: {:?}, v2: {:?}", v1, v2);
+        }
         if let Argument::WithValue(_, ref v, ArgDisposition::CanBeSeparated(_)) = item.arg {
             if OsString::from(v.clone()).starts_with("@") {
                 return CompilerArguments::CannotCache("@");
