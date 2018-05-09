@@ -28,7 +28,7 @@ impl Client {
     pub unsafe fn new() -> Client {
         match jobserver::Client::from_env() {
             Some(c) => Client::_new(c, true),
-            None => Client::new_num(num_cpus::get()),
+            None => Client::new_num(1),
         }
     }
 

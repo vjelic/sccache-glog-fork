@@ -125,7 +125,7 @@ pub fn start_server(port: u16) -> Result<()> {
     trace!("start_server");
     let client = unsafe { Client::new() };
     let core = Core::new()?;
-    let pool = CpuPool::new(3);
+    let pool = CpuPool::new(num_cpus::get());
     let storage = storage_from_environment(&pool, &core.handle());
     let res = SccacheServer::<ProcessCommandCreator>::new(port, pool, core, client, storage);
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
