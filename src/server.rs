@@ -478,7 +478,9 @@ impl<C> SccacheService<C>
                 // so do it asynchronously.
                 let me = self.clone();
 
-                let info = get_compiler_info(&self.creator, &path, &self.pool);
+                let new_pool = CpuPool::new(num_cpus::get());
+
+                let info = get_compiler_info(&self.creator, &path, &new_pool);
                 Box::new(info.then(move |info| {
                     let info = info.ok();
                     me.compilers.borrow_mut().insert(path, info.clone().map(|i| (i, mtime)));
