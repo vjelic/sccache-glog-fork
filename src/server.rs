@@ -61,6 +61,7 @@ use tokio_proto::streaming::{Body, Message};
 use tokio_serde_bincode::{ReadBincode, WriteBincode};
 use tokio_service::Service;
 use util::fmt_duration_as_secs;
+use num_cpus;
 
 use errors::*;
 
@@ -124,7 +125,7 @@ pub fn start_server(port: u16) -> Result<()> {
     trace!("start_server");
     let client = unsafe { Client::new() };
     let core = Core::new()?;
-    let pool = CpuPool::new(20);
+    let pool = CpuPool::new(num_cpus::get());
     let storage = storage_from_environment(&pool, &core.handle());
     let res = SccacheServer::<ProcessCommandCreator>::new(port, pool, core, client, storage);
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
