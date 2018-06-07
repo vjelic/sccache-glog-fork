@@ -52,6 +52,7 @@ impl CCompilerImpl for Clang {
                        arguments: &[OsString],
                        cwd: &Path) -> CompilerArguments<ParsedArguments>
     {
+        eprintln!("Clang parse_arguments: {:?}", arguments);
         gcc::parse_arguments(arguments, cwd, (&gcc::ARGS[..], &ARGS[..]))
     }
 

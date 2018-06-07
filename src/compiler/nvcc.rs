@@ -53,6 +53,7 @@ impl CCompilerImpl for NVCC {
                        arguments: &[OsString],
                        cwd: &Path) -> CompilerArguments<ParsedArguments>
     {
+        eprintln!("NVCC parse_arguments: {:?}", arguments);
         gcc::parse_arguments(arguments, cwd, (&gcc::ARGS[..], &ARGS[..]))
     }
 
