@@ -56,7 +56,7 @@ impl CCompilerImpl for MSVC {
                        arguments: &[OsString],
                        _cwd: &Path) -> CompilerArguments<ParsedArguments>
     {
-        parse_arguments(arguments)
+        parse_arguments(arguments, &ARGS[..])
     }
 
     fn preprocess<T>(&self,
@@ -185,7 +185,7 @@ fn encode_path(dst: &mut Write, path: &Path) -> io::Result<()> {
 }
 
 #[derive(Clone, Debug)]
-enum MSVCArgAttribute {
+pub enum MSVCArgAttribute {
     TooHard,
     PreprocessorArgument,
     DoCompilation,
@@ -198,7 +198,7 @@ enum MSVCArgAttribute {
 
 use self::MSVCArgAttribute::*;
 
-static ARGS: [(ArgInfo, MSVCArgAttribute); 20] = [
+pub static ARGS: [(ArgInfo, MSVCArgAttribute); 20] = [
     take_arg!("-D", String, Concatenated, PreprocessorArgument),
     take_arg!("-FA", String, Concatenated, TooHard),
     take_arg!("-FI", Path, CanBeSeparated, PreprocessorArgument),
@@ -221,7 +221,14 @@ static ARGS: [(ArgInfo, MSVCArgAttribute); 20] = [
     take_arg!("@", Path, Concatenated, TooHard),
 ];
 
-pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArguments> {
+// pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArguments> {
+pub fn parse_arguments<S>(
+    arguments: &[OsString],
+    arg_info: S,
+) -> CompilerArguments<ParsedArguments>
+where
+    S: SearchableArgInfo<Info = (ArgInfo, MSVCArgAttribute)>,
+{
     let mut output_arg = None;
     let mut input_arg = None;
     let mut common_args = vec!();
@@ -242,7 +249,7 @@ pub fn parse_arguments(arguments: &[OsString]) -> CompilerArguments<ParsedArgume
         }
     });
 
-    for item in ArgsIter::new(it, &ARGS[..]) {
+    for item in ArgsIter::new(it, arg_info) {
         match item.data {
             Some(TooHard) => {
                 return CompilerArguments::CannotCache(item.arg.to_str().expect(
@@ -450,7 +457,7 @@ pub fn preprocess<T>(creator: &T,
     }))
 }
 
-fn compile<T>(creator: &T,
+pub fn compile<T>(creator: &T,
               executable: &Path,
               parsed_args: &ParsedArguments,
               cwd: &Path,
