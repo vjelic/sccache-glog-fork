@@ -55,6 +55,8 @@ pub enum Command {
         /// The environment variables to use for execution.
         env_vars: Vec<(OsString, OsString)>,
     },
+    /// No-op (for commands that we don't want to care about, like "/?" on Windows)
+    NoOp,
 }
 
 /// Get the `App` used for argument parsing.
@@ -95,6 +97,11 @@ pub fn parse() -> Result<Command> {
         Err(_) => false,
     };
     let mut args: Vec<_> = env::args_os().collect();
+    if cfg!(windows) {
+        if args.iter().any(|x| x == "/?") {
+            return Ok(Command::NoOp)
+        }
+    }
     if ! internal_start_server {
         if let Ok(exe) = env::current_exe() {
             match exe.file_stem().and_then(|s| s.to_str()).map(|s| s.to_lowercase()) {
