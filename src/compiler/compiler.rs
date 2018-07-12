@@ -18,11 +18,13 @@ use cache::{
     Storage,
 };
 use compiler::msvc;
+use compiler::clangcl;
 use compiler::c::{CCompiler, CCompilerKind};
 use compiler::clang::Clang;
 use compiler::gcc::GCC;
 use compiler::nvcc::NVCC;
 use compiler::msvc::MSVC;
+use compiler::clangcl::ClangCl;
 use compiler::rust::Rust;
 use futures::{Future, IntoFuture};
 use futures_cpupool::CpuPool;
@@ -537,6 +539,17 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
     if executable_str.ends_with("nvcc") || executable_str.ends_with("nvcc.exe") {
         debug!("Found NVCC");
         return Box::new(CCompiler::new(NVCC, executable, &pool)
+                        .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+    }
+
+    // The detection script doesn't work with clang-cl (it would say that it's msvc, which
+    // is not what we want), have to assume clang-cl executable name ends with "clang-cl"
+    // or "clang-cl.exe" instead.
+    let executable_str = executable.clone().into_os_string().into_string().unwrap();
+    debug!("executable: {}", executable_str);
+    if executable_str.ends_with("clang-cl") || executable_str.ends_with("clang-cl.exe") {
+        debug!("Found clang-cl");
+        return Box::new(CCompiler::new(ClangCl, executable, &pool)
                         .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
     }
 
