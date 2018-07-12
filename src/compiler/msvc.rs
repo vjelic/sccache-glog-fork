@@ -198,7 +198,8 @@ pub enum MSVCArgAttribute {
 
 use self::MSVCArgAttribute::*;
 
-pub static ARGS: [(ArgInfo, MSVCArgAttribute); 20] = [
+pub static ARGS: [(ArgInfo, MSVCArgAttribute); 21] = [
+    flag!("--show-includes", ShowIncludes),
     take_arg!("-D", String, Concatenated, PreprocessorArgument),
     take_arg!("-FA", String, Concatenated, TooHard),
     take_arg!("-FI", Path, CanBeSeparated, PreprocessorArgument),
