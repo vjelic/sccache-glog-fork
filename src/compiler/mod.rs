@@ -19,6 +19,7 @@ mod clang;
 mod compiler;
 mod gcc;
 mod nvcc;
+mod hcc;
 mod msvc;
 mod clangcl;
 mod rust;
