@@ -538,8 +538,8 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
     let executable_str = executable.clone().into_os_string().into_string().unwrap();
     debug!("executable: {}", executable_str);
     if executable_str.ends_with("nvcc") || executable_str.ends_with("nvcc.exe") {
-      debug!("Found NVCC");
-      return Box::new(CCompiler::new(NVCC, executable, &pool)
+        debug!("Found NVCC");
+        return Box::new(CCompiler::new(NVCC, executable, &pool)
                       .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
     }
 
