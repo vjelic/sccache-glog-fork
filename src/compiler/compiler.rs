@@ -540,7 +540,7 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
     if executable_str.ends_with("nvcc") || executable_str.ends_with("nvcc.exe") {
         debug!("Found NVCC");
         return Box::new(CCompiler::new(NVCC, executable, &pool)
-                      .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+                        .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
     }
 
     // The detection script doesn't work with clang-cl (it would say that it's msvc, which
