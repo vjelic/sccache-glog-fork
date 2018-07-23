@@ -23,6 +23,7 @@ use compiler::c::{CCompiler, CCompilerKind};
 use compiler::clang::Clang;
 use compiler::gcc::GCC;
 use compiler::nvcc::NVCC;
+use compiler::hcc::HCC;
 use compiler::msvc::MSVC;
 use compiler::clangcl::ClangCl;
 use compiler::rust::Rust;
@@ -560,6 +561,8 @@ msvc
 clang
 #elif defined(__GNUC__)
 gcc
+#elif defined(__HCC__)
+hcc
 #endif
 ".to_vec();
     let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
@@ -605,6 +608,10 @@ gcc
                     }, executable, &pool)
                         .map(|c| Some(Box::new(c) as Box<Compiler<T>>))
                 }))
+            } else if line == "hcc" {
+                debug!("Found hcc");
+                return Box::new(CCompiler::new(HCC, executable, &pool)
+                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
             }
         }
         debug!("nothing useful in detection output {:?}", stdout);
