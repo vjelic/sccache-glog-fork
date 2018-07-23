@@ -533,6 +533,16 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
 {
     trace!("detect_c_compiler");
 
+    // The detection script doesn't work with NVCC, have to assume NVCC executable name
+      // ends with "nvcc" or "nvcc.exe" instead.
+      let executable_str = executable.clone().into_os_string().into_string().unwrap();
+      debug!("executable: {}", executable_str);
+      if executable_str.ends_with("nvcc") || executable_str.ends_with("nvcc.exe") {
+          debug!("Found NVCC");
+          return Box::new(CCompiler::new(NVCC, executable, &pool)
+                          .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+      }
+
     // The detection script doesn't work with clang-cl (it would say that it's msvc, which
     // is not what we want), have to assume clang-cl executable name ends with "clang-cl"
     // or "clang-cl.exe" instead.
@@ -545,8 +555,7 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
     }
 
     // Otherwise, check if compiler is one of MSVC / Clang / GCC / NVCC
-    // On Windows, when NVCC is used, the MSC_VER flag will be set, so handle that below.
-    let test = b"#if defined(_MSC_VER) && !defined(__NVCC__)
+    let test = b"#if defined(_MSC_VER)
 msvc
 #elif defined(__clang__)
 clang
@@ -554,8 +563,6 @@ clang
 gcc
 #elif defined(__HCC__)
 hcc
-#elif defined(__NVCC__)
-nvcc
 #endif
 ".to_vec();
     let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
@@ -601,10 +608,6 @@ nvcc
                     }, executable, &pool)
                         .map(|c| Some(Box::new(c) as Box<Compiler<T>>))
                 }))
-            } else if line == "nvcc" {
-                debug!("Found nvcc");
-                return Box::new(CCompiler::new(NVCC, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
             } else if line == "hcc" {
                 debug!("Found hcc");
                 return Box::new(CCompiler::new(HCC, executable, &pool)
