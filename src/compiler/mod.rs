@@ -16,7 +16,10 @@
 mod args;
 mod c;
 mod clang;
+#[macro_use]
+#[allow(clippy::module_inception)]
 mod compiler;
+mod diab;
 mod gcc;
 mod nvcc;
 mod hcc;
@@ -24,4 +27,4 @@ mod msvc;
 mod clangcl;
 mod rust;
 
-pub use compiler::compiler::*;
+pub use crate::compiler::compiler::*;

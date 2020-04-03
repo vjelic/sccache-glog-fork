@@ -12,47 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use byteorder::{ByteOrder, BigEndian};
-use protocol::{Request, Response};
+use crate::errors::*;
+use crate::protocol::{Request, Response};
+use crate::util;
+use byteorder::{BigEndian, ByteOrder};
 use retry::retry;
-use bincode;
-use errors::*;
-use std::io::{
-    self,
-    BufReader,
-    BufWriter,
-    Read,
-    Write,
-};
+use std::io::{self, BufReader, BufWriter, Read};
 use std::net::TcpStream;
 
 /// A connection to an sccache server.
 pub struct ServerConnection {
     /// A reader for the socket connected to the server.
-    reader : BufReader<TcpStream>,
+    reader: BufReader<TcpStream>,
     /// A writer for the socket connected to the server.
-    writer : BufWriter<TcpStream>,
+    writer: BufWriter<TcpStream>,
 }
 
 impl ServerConnection {
     /// Create a new connection using `stream`.
-    pub fn new(stream : TcpStream) -> io::Result<ServerConnection> {
-        let writer = try!(stream.try_clone());
+    pub fn new(stream: TcpStream) -> io::Result<ServerConnection> {
+        let writer = stream.try_clone()?;
         Ok(ServerConnection {
-            reader : BufReader::new(stream),
-            writer : BufWriter::new(writer),
+            reader: BufReader::new(stream),
+            writer: BufWriter::new(writer),
         })
     }
 
     /// Send `request` to the server, read and return a `Response`.
     pub fn request(&mut self, request: Request) -> Result<Response> {
         trace!("ServerConnection::request");
-        let bytes = bincode::serialize(&request, bincode::Infinite)?;
-        let mut len = [0; 4];
-        BigEndian::write_u32(&mut len, bytes.len() as u32);
-        self.writer.write_all(&len)?;
-        self.writer.write_all(&bytes)?;
-        self.writer.flush()?;
+        util::write_length_prefixed_bincode(&mut self.writer, request)?;
         trace!("ServerConnection::request: sent request");
         self.read_one_response()
     }
@@ -61,7 +50,9 @@ impl ServerConnection {
     pub fn read_one_response(&mut self) -> Result<Response> {
         trace!("ServerConnection::read_one_response");
         let mut bytes = [0; 4];
-        self.reader.read_exact(&mut bytes).chain_err(|| "Failed to read response header")?;
+        self.reader
+            .read_exact(&mut bytes)
+            .chain_err(|| "Failed to read response header")?;
         let len = BigEndian::read_u32(&bytes);
         trace!("Should read {} more bytes", len);
         let mut data = vec![0; len as usize];
@@ -74,7 +65,7 @@ impl ServerConnection {
 /// Establish a TCP connection to an sccache server listening on `port`.
 pub fn connect_to_server(port: u16) -> io::Result<ServerConnection> {
     trace!("connect_to_server({})", port);
-    let stream = try!(TcpStream::connect(("127.0.0.1", port)));
+    let stream = TcpStream::connect(("127.0.0.1", port))?;
     ServerConnection::new(stream)
 }
 
@@ -90,7 +81,9 @@ pub fn connect_with_retry(port: u16) -> io::Result<ServerConnection> {
     //   us once it starts the server instead of us polling.
     match retry(10, 500, || connect_to_server(port), |res| res.is_ok()) {
         Ok(Ok(conn)) => Ok(conn),
-        _ => Err(io::Error::new(io::ErrorKind::TimedOut,
-                                "Connection to server timed out")),
+        _ => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Connection to server timed out",
+        )),
     }
 }

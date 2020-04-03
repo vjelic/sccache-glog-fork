@@ -12,51 +12,74 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cache::{
-    Cache,
-    CacheWrite,
-    Storage,
-};
-use compiler::msvc;
-use compiler::clangcl;
-use compiler::c::{CCompiler, CCompilerKind};
-use compiler::clang::Clang;
-use compiler::gcc::GCC;
-use compiler::nvcc::NVCC;
-use compiler::hcc::HCC;
-use compiler::msvc::MSVC;
-use compiler::clangcl::ClangCl;
-use compiler::rust::Rust;
-use futures::{Future, IntoFuture};
+use crate::cache::{Cache, CacheWrite, Storage};
+use crate::compiler::c::{CCompiler, CCompilerKind};
+use crate::compiler::clang::Clang;
+use crate::compiler::diab::Diab;
+use crate::compiler::gcc::GCC;
+use crate::compiler::msvc;
+use crate::compiler::msvc::MSVC;
+use crate::compiler::rust::{Rust, RustupProxy};
+use crate::compiler::clangcl;
+use crate::compiler::nvcc::NVCC;
+use crate::compiler::hcc::HCC;
+use crate::compiler::clangcl::ClangCl;
+use crate::dist;
+#[cfg(feature = "dist-client")]
+use crate::dist::pkg;
+use crate::mock_command::{exit_status, CommandChild, CommandCreatorSync, RunCommand};
+use crate::util::{fmt_duration_as_secs, ref_env, run_input_output};
+use filetime::FileTime;
+use futures::Future;
 use futures_cpupool::CpuPool;
-use mock_command::{
-    CommandChild,
-    CommandCreatorSync,
-    RunCommand,
-    exit_status,
-};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
-#[cfg(unix)]
+#[cfg(any(feature = "dist-client", unix))]
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
-use std::process::{self,Stdio};
+use std::process::{self, Stdio};
 use std::str;
 use std::sync::Arc;
-use std::time::{
-    Duration,
-    Instant,
-};
-use tempdir::TempDir;
-use tempfile::NamedTempFile;
-use util::fmt_duration_as_secs;
-use tokio_core::reactor::{Handle, Timeout};
+use std::time::{Duration, Instant};
+use tempfile::{NamedTempFile, TempDir};
+use tokio_timer::Timeout;
 
-use errors::*;
+use crate::errors::*;
+
+/// Can dylibs (shared libraries or proc macros) be distributed on this platform?
+#[cfg(all(feature = "dist-client", target_os = "linux", target_arch = "x86_64"))]
+pub const CAN_DIST_DYLIBS: bool = true;
+#[cfg(all(
+    feature = "dist-client",
+    not(all(target_os = "linux", target_arch = "x86_64"))
+))]
+pub const CAN_DIST_DYLIBS: bool = false;
+
+#[derive(Clone, Debug)]
+pub struct CompileCommand {
+    pub executable: PathBuf,
+    pub arguments: Vec<OsString>,
+    pub env_vars: Vec<(OsString, OsString)>,
+    pub cwd: PathBuf,
+}
+
+impl CompileCommand {
+    pub fn execute<T>(self, creator: &T) -> SFuture<process::Output>
+    where
+        T: CommandCreatorSync,
+    {
+        let mut cmd = creator.clone().new_command_sync(self.executable);
+        cmd.args(&self.arguments)
+            .env_clear()
+            .envs(self.env_vars)
+            .current_dir(self.cwd);
+        Box::new(run_input_output(cmd, None))
+    }
+}
 
 /// Supported compilers.
 #[derive(Debug, PartialEq, Clone)]
@@ -67,66 +90,139 @@ pub enum CompilerKind {
     Rust,
 }
 
+impl CompilerKind {
+    pub fn lang_kind(&self) -> String {
+        match self {
+            CompilerKind::C(_) => "C/C++",
+            CompilerKind::Rust => "Rust",
+        }
+        .to_string()
+    }
+}
+
+#[cfg(feature = "dist-client")]
+pub type DistPackagers = (
+    Box<dyn pkg::InputsPackager>,
+    Box<dyn pkg::ToolchainPackager>,
+    Box<dyn OutputsRewriter>,
+);
+
 /// An interface to a compiler for argument parsing.
 pub trait Compiler<T>: Send + 'static
-    where T: CommandCreatorSync,
+where
+    T: CommandCreatorSync,
 {
     /// Return the kind of compiler.
     fn kind(&self) -> CompilerKind;
+    /// Retrieve a packager
+    #[cfg(feature = "dist-client")]
+    fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager>;
     /// Determine whether `arguments` are supported by this compiler.
-    fn parse_arguments(&self,
-                       arguments: &[OsString],
-                       cwd: &Path) -> CompilerArguments<Box<CompilerHasher<T> + 'static>>;
-    fn box_clone(&self) -> Box<Compiler<T>>;
+    fn parse_arguments(
+        &self,
+        arguments: &[OsString],
+        cwd: &Path,
+    ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>>;
+    fn box_clone(&self) -> Box<dyn Compiler<T>>;
 }
 
-impl<T: CommandCreatorSync> Clone for Box<Compiler<T>> {
-    fn clone(&self) -> Box<Compiler<T>> { self.box_clone() }
+impl<T: CommandCreatorSync> Clone for Box<dyn Compiler<T>> {
+    fn clone(&self) -> Box<dyn Compiler<T>> {
+        self.box_clone()
+    }
+}
+
+pub trait CompilerProxy<T>: Send + 'static
+where
+    T: CommandCreatorSync + Sized,
+{
+    /// Maps the executable to be used in `cwd` to the true, proxied compiler.
+    ///
+    /// Returns the absolute path to the true compiler and the timestamp of
+    /// timestamp of the true compiler. Iff the resolution fails,
+    /// the returned future resolves to an error with more information.
+    fn resolve_proxied_executable(
+        &self,
+        creator: T,
+        cwd: PathBuf,
+        env_vars: &[(OsString,OsString)],
+    ) -> SFuture<(PathBuf, FileTime)>;
+
+    /// Create a clone of `Self` and puts it in a `Box`
+    fn box_clone(&self) -> Box<dyn CompilerProxy<T>>;
 }
 
 /// An interface to a compiler for hash key generation, the result of
 /// argument parsing.
 pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
-    where T: CommandCreatorSync,
+where
+    T: CommandCreatorSync,
 {
     /// Given information about a compiler command, generate a hash key
     /// that can be used for cache lookups, as well as any additional
     /// information that can be reused for compilation if necessary.
-    fn generate_hash_key(self: Box<Self>,
-                         creator: &T,
-                         cwd: &Path,
-                         env_vars: &[(OsString, OsString)],
-                         pool: &CpuPool)
-                         -> SFuture<HashResult<T>>;
+    fn generate_hash_key(
+        self: Box<Self>,
+        creator: &T,
+        cwd: PathBuf,
+        env_vars: Vec<(OsString, OsString)>,
+        may_dist: bool,
+        pool: &CpuPool,
+        rewrite_includes_only: bool,
+    ) -> SFuture<HashResult>;
 
     /// Return the state of any `--color` option passed to the compiler.
     fn color_mode(&self) -> ColorMode;
 
     /// Look up a cached compile result in `storage`. If not found, run the
     /// compile and store the result.
-    fn get_cached_or_compile(self: Box<Self>,
-                             creator: T,
-                             storage: Arc<Storage>,
-                             arguments: Vec<OsString>,
-                             cwd: PathBuf,
-                             env_vars: Vec<(OsString, OsString)>,
-                             cache_control: CacheControl,
-                             pool: CpuPool,
-                             handle: Handle)
-                             -> SFuture<(CompileResult, process::Output)>
-    {
+    #[allow(clippy::too_many_arguments)]
+    fn get_cached_or_compile(
+        self: Box<Self>,
+        dist_client: Result<Option<Arc<dyn dist::Client>>>,
+        creator: T,
+        storage: Arc<dyn Storage>,
+        arguments: Vec<OsString>,
+        cwd: PathBuf,
+        env_vars: Vec<(OsString, OsString)>,
+        cache_control: CacheControl,
+        pool: CpuPool,
+    ) -> SFuture<(CompileResult, process::Output)> {
         let out_pretty = self.output_pretty().into_owned();
         debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
         let start = Instant::now();
-        let result = self.generate_hash_key(&creator, &cwd, &env_vars, &pool);
+        let may_dist = match dist_client {
+            Ok(Some(_)) => true,
+            _ => false,
+        };
+        let rewrite_includes_only = match dist_client {
+            Ok(Some(ref client)) => client.rewrite_includes_only(),
+            _ => false,
+        };
+        let result = self.generate_hash_key(
+            &creator,
+            cwd.clone(),
+            env_vars,
+            may_dist,
+            &pool,
+            rewrite_includes_only,
+        );
         Box::new(result.then(move |res| -> SFuture<_> {
-            debug!("[{}]: generate_hash_key took {}", out_pretty, fmt_duration_as_secs(&start.elapsed()));
-            let (key, compilation) = match res {
+            debug!(
+                "[{}]: generate_hash_key took {}",
+                out_pretty,
+                fmt_duration_as_secs(&start.elapsed())
+            );
+            let (key, compilation, weak_toolchain_key) = match res {
                 Err(Error(ErrorKind::ProcessError(output), _)) => {
                     return f_ok((CompileResult::Error, output));
                 }
                 Err(e) => return f_err(e),
-                Ok(HashResult { key, compilation }) => (key, compilation),
+                Ok(HashResult {
+                    key,
+                    compilation,
+                    weak_toolchain_key,
+                }) => (key, compilation, weak_toolchain_key),
             };
             trace!("[{}]: Hash key: {}", out_pretty, key);
             // If `ForceRecache` is enabled, we won't check the cache.
@@ -140,33 +236,28 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
             // Set a maximum time limit for the cache to respond before we forge
             // ahead ourselves with a compilation.
             let timeout = Duration::new(60, 0);
-            let timeout = Timeout::new(timeout, &handle).into_future().flatten();
-
-            let cache_status = cache_status.map(Some);
-            let timeout = timeout.map(|_| None).chain_err(|| "timeout error");
-            let cache_status = cache_status.select(timeout).then(|r| {
-                match r {
-                    Ok((e, _other)) => Ok(e),
-                    Err((e, _other)) => Err(e),
-                }
-            });
+            let cache_status = Timeout::new(cache_status, timeout);
 
             // Check the result of the cache lookup.
             Box::new(cache_status.then(move |result| {
                 let duration = start.elapsed();
-                let pwd = Path::new(&cwd);
-                let outputs = compilation.outputs()
-                    .map(|(key, path)| (key.to_string(), pwd.join(path)))
+                let outputs = compilation
+                    .outputs()
+                    .map(|(key, path)| (key.to_string(), cwd.join(path)))
                     .collect::<HashMap<_, _>>();
 
                 let miss_type = match result {
-                    Ok(Some(Cache::Hit(mut entry))) => {
-                        debug!("[{}]: Cache hit in {}", out_pretty, fmt_duration_as_secs(&duration));
+                    Ok(Cache::Hit(mut entry)) => {
+                        debug!(
+                            "[{}]: Cache hit in {}",
+                            out_pretty,
+                            fmt_duration_as_secs(&duration)
+                        );
                         let mut stdout = Vec::new();
                         let mut stderr = Vec::new();
                         drop(entry.get_object("stdout", &mut stdout));
                         drop(entry.get_object("stderr", &mut stderr));
-                        let write = pool.spawn_fn(move ||{
+                        let write = pool.spawn_fn(move || {
                             for (key, path) in &outputs {
                                 let dir = match path.parent() {
                                     Some(d) => d,
@@ -186,97 +277,136 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
                         });
                         let output = process::Output {
                             status: exit_status(0),
-                            stdout: stdout,
-                            stderr: stderr,
+                            stdout,
+                            stderr,
                         };
                         let result = CompileResult::CacheHit(duration);
-                        return Box::new(write.map(|_| {
-                            (result, output)
-                        })) as SFuture<_>
+                        return Box::new(write.map(|_| (result, output))) as SFuture<_>;
                     }
-                    Ok(Some(Cache::Miss)) => {
-                        debug!("[{}]: Cache miss in {}", out_pretty, fmt_duration_as_secs(&duration));
+                    Ok(Cache::Miss) => {
+                        debug!(
+                            "[{}]: Cache miss in {}",
+                            out_pretty,
+                            fmt_duration_as_secs(&duration)
+                        );
                         MissType::Normal
                     }
-                    Ok(Some(Cache::Recache)) => {
-                        debug!("[{}]: Cache recache in {}", out_pretty, fmt_duration_as_secs(&duration));
+                    Ok(Cache::Recache) => {
+                        debug!(
+                            "[{}]: Cache recache in {}",
+                            out_pretty,
+                            fmt_duration_as_secs(&duration)
+                        );
                         MissType::ForcedRecache
                     }
-                    Ok(None) => {
-                        debug!("[{}]: Cache timed out {}", out_pretty, fmt_duration_as_secs(&duration));
-                        MissType::TimedOut
-                    }
                     Err(err) => {
-                        error!("[{}]: Cache read error: {}", out_pretty, err);
-                        for e in err.iter().skip(1) {
-                            error!("[{}] \t{}", out_pretty, e);
+                        if err.is_elapsed() {
+                            debug!(
+                                "[{}]: Cache timed out {}",
+                                out_pretty,
+                                fmt_duration_as_secs(&duration)
+                            );
+                            MissType::TimedOut
+                        } else {
+                            error!("[{}]: Cache read error: {}", out_pretty, err);
+                            if err.is_inner() {
+                                let err = err.into_inner().unwrap();
+                                for e in err.iter().skip(1) {
+                                    error!("[{}] \t{}", out_pretty, e);
+                                }
+                            }
+                            MissType::CacheReadError
                         }
-                        MissType::CacheReadError
                     }
                 };
 
                 // Cache miss, so compile it.
                 let start = Instant::now();
-                let out_pretty = out_pretty.clone();
-                let compile = compilation.compile(&creator, &cwd, &env_vars);
-                Box::new(compile.and_then(move |(cacheable, compiler_result)| {
-                    let duration = start.elapsed();
-                    if !compiler_result.status.success() {
-                        debug!("[{}]: Compiled but failed, not storing in cache",
-                               out_pretty);
-                        return f_ok((CompileResult::CompileFailed, compiler_result))
-                            as SFuture<_>
-                    }
-                    if cacheable != Cacheable::Yes {
-                        // Not cacheable
-                        debug!("[{}]: Compiled but not cacheable",
-                               out_pretty);
-                        return f_ok((CompileResult::NotCacheable, compiler_result))
-                    }
-                    debug!("[{}]: Compiled in {}, storing in cache", out_pretty, fmt_duration_as_secs(&duration));
-                    let write = pool.spawn_fn(move || -> Result<_> {
-                        let mut entry = CacheWrite::new();
-                        for (key, path) in &outputs {
-                            let mut f = File::open(&path)?;
-                            let mode = get_file_mode(&path)?;
-                            entry.put_object(key, &mut f, mode).chain_err(|| {
-                                format!("failed to put object `{:?}` in zip", path)
-                            })?;
-                        }
-                        Ok(entry)
-                    });
-                    let write = write.chain_err(|| "failed to zip up compiler outputs");
-                    let o = out_pretty.clone();
-                    Box::new(write.and_then(move |mut entry| {
-                        if !compiler_result.stdout.is_empty() {
-                            let mut stdout = &compiler_result.stdout[..];
-                            entry.put_object("stdout", &mut stdout, None)?;
-                        }
-                        if !compiler_result.stderr.is_empty() {
-                            let mut stderr = &compiler_result.stderr[..];
-                            entry.put_object("stderr", &mut stderr, None)?;
-                        }
+                let compile = dist_or_local_compile(
+                    dist_client,
+                    creator,
+                    cwd,
+                    compilation,
+                    weak_toolchain_key,
+                    out_pretty.clone(),
+                );
 
-                        // Try to finish storing the newly-written cache
-                        // entry. We'll get the result back elsewhere.
-                        let out_pretty = out_pretty.clone();
-                        let future = storage.put(&key, entry)
-                            .then(move |res| {
-                                match res {
-                                    Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
-                                    Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
-                                }
-                                res.map(|duration| CacheWriteInfo {
-                                    object_file_pretty: out_pretty,
-                                    duration: duration,
+                Box::new(
+                    compile.and_then(move |(cacheable, dist_type, compiler_result)| {
+                        let duration = start.elapsed();
+                        if !compiler_result.status.success() {
+                            debug!(
+                                "[{}]: Compiled but failed, not storing in cache",
+                                out_pretty
+                            );
+                            return f_ok((CompileResult::CompileFailed, compiler_result))
+                                as SFuture<_>;
+                        }
+                        if cacheable != Cacheable::Yes {
+                            // Not cacheable
+                            debug!("[{}]: Compiled but not cacheable", out_pretty);
+                            return f_ok((CompileResult::NotCacheable, compiler_result));
+                        }
+                        debug!(
+                            "[{}]: Compiled in {}, storing in cache",
+                            out_pretty,
+                            fmt_duration_as_secs(&duration)
+                        );
+                        let write = pool.spawn_fn(move || -> Result<_> {
+                            let mut entry = CacheWrite::new();
+                            for (key, path) in &outputs {
+                                let mut f = File::open(&path)?;
+                                let mode = get_file_mode(&f)?;
+                                entry.put_object(key, &mut f, mode).chain_err(|| {
+                                    format!("failed to put object `{:?}` in zip", path)
+                                })?;
+                            }
+                            Ok(entry)
+                        });
+                        let write = write.chain_err(|| "failed to zip up compiler outputs");
+                        let o = out_pretty.clone();
+                        Box::new(
+                            write
+                                .and_then(move |mut entry| {
+                                    if !compiler_result.stdout.is_empty() {
+                                        let mut stdout = &compiler_result.stdout[..];
+                                        entry.put_object("stdout", &mut stdout, None)?;
+                                    }
+                                    if !compiler_result.stderr.is_empty() {
+                                        let mut stderr = &compiler_result.stderr[..];
+                                        entry.put_object("stderr", &mut stderr, None)?;
+                                    }
+
+                                    // Try to finish storing the newly-written cache
+                                    // entry. We'll get the result back elsewhere.
+                                    let future = storage.put(&key, entry).then(move |res| {
+                                        match res {
+                                            Ok(_) => debug!(
+                                                "[{}]: Stored in cache successfully!",
+                                                out_pretty
+                                            ),
+                                            Err(ref e) => debug!(
+                                                "[{}]: Cache write error: {:?}",
+                                                out_pretty, e
+                                            ),
+                                        }
+                                        res.map(|duration| CacheWriteInfo {
+                                            object_file_pretty: out_pretty,
+                                            duration,
+                                        })
+                                    });
+                                    let future = Box::new(future);
+                                    Ok((
+                                        CompileResult::CacheMiss(
+                                            miss_type, dist_type, duration, future,
+                                        ),
+                                        compiler_result,
+                                    ))
                                 })
-                            });
-                        let future = Box::new(future);
-                        Ok((CompileResult::CacheMiss(miss_type, duration, future), compiler_result))
-                    }).chain_err(move || {
-                        format!("failed to store `{}` to cache", o)
-                    }))
-                }))
+                                .chain_err(move || format!("failed to store `{}` to cache", o)),
+                        )
+                    }),
+                )
             }))
         }))
     }
@@ -285,51 +415,324 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
     ///
     /// This is primarily intended for debug logging and such, not for actual
     /// artifact generation.
-    fn output_pretty(&self) -> Cow<str>;
+    fn output_pretty(&self) -> Cow<'_, str>;
 
-    fn box_clone(&self) -> Box<CompilerHasher<T>>;
+    fn box_clone(&self) -> Box<dyn CompilerHasher<T>>;
 }
 
-impl<T: CommandCreatorSync> Clone for Box<CompilerHasher<T>> {
-    fn clone(&self) -> Box<CompilerHasher<T>> { self.box_clone() }
+#[cfg(not(feature = "dist-client"))]
+fn dist_or_local_compile<T>(
+    _dist_client: Result<Option<Arc<dyn dist::Client>>>,
+    creator: T,
+    _cwd: PathBuf,
+    compilation: Box<dyn Compilation>,
+    _weak_toolchain_key: String,
+    out_pretty: String,
+) -> SFuture<(Cacheable, DistType, process::Output)>
+where
+    T: CommandCreatorSync,
+{
+    let mut path_transformer = dist::PathTransformer::default();
+    let compile_commands = compilation
+        .generate_compile_commands(&mut path_transformer, true)
+        .chain_err(|| "Failed to generate compile commands");
+    let (compile_cmd, _dist_compile_cmd, cacheable) = match compile_commands {
+        Ok(cmds) => cmds,
+        Err(e) => return f_err(e),
+    };
+
+    debug!("[{}]: Compiling locally", out_pretty);
+    Box::new(
+        compile_cmd
+            .execute(&creator)
+            .map(move |o| (cacheable, DistType::NoDist, o)),
+    )
+}
+
+#[cfg(feature = "dist-client")]
+fn dist_or_local_compile<T>(
+    dist_client: Result<Option<Arc<dyn dist::Client>>>,
+    creator: T,
+    cwd: PathBuf,
+    compilation: Box<dyn Compilation>,
+    weak_toolchain_key: String,
+    out_pretty: String,
+) -> SFuture<(Cacheable, DistType, process::Output)>
+where
+    T: CommandCreatorSync,
+{
+    use futures::future;
+    use std::io;
+
+    let rewrite_includes_only = match dist_client {
+        Ok(Some(ref client)) => client.rewrite_includes_only(),
+        _ => false,
+    };
+    let mut path_transformer = dist::PathTransformer::default();
+    let compile_commands = compilation
+        .generate_compile_commands(&mut path_transformer, rewrite_includes_only)
+        .chain_err(|| "Failed to generate compile commands");
+    let (compile_cmd, dist_compile_cmd, cacheable) = match compile_commands {
+        Ok(cmds) => cmds,
+        Err(e) => return f_err(e),
+    };
+
+    let dist_client = match dist_client {
+        Ok(Some(dc)) => dc,
+        Ok(None) => {
+            debug!("[{}]: Compiling locally", out_pretty);
+            return Box::new(
+                compile_cmd
+                    .execute(&creator)
+                    .map(move |o| (cacheable, DistType::NoDist, o)),
+            );
+        }
+        Err(e) => {
+            return f_err(e);
+        }
+    };
+
+    debug!("[{}]: Attempting distributed compilation", out_pretty);
+    let compile_out_pretty = out_pretty.clone();
+    let compile_out_pretty2 = out_pretty.clone();
+    let compile_out_pretty3 = out_pretty.clone();
+    let compile_out_pretty4 = out_pretty;
+    let local_executable = compile_cmd.executable.clone();
+    let local_executable2 = local_executable.clone();
+    // TODO: the number of map_errs is subideal, but there's no futures-based carrier trait AFAIK
+    Box::new(future::result(dist_compile_cmd.ok_or_else(|| "Could not create distributed compile command".into()))
+        .and_then(move |dist_compile_cmd| {
+            debug!("[{}]: Creating distributed compile request", compile_out_pretty);
+            let dist_output_paths = compilation.outputs()
+                .map(|(_key, path)| path_transformer.as_dist_abs(&cwd.join(path)))
+                .collect::<Option<_>>()
+                .ok_or_else(|| Error::from("Failed to adapt an output path for distributed compile"))?;
+            compilation.into_dist_packagers(path_transformer)
+                .map(|packagers| (dist_compile_cmd, packagers, dist_output_paths))
+        })
+        .and_then(move |(mut dist_compile_cmd, (inputs_packager, toolchain_packager, outputs_rewriter), dist_output_paths)| {
+            debug!("[{}]: Identifying dist toolchain for {:?}", compile_out_pretty2, local_executable);
+            dist_client.put_toolchain(&local_executable, &weak_toolchain_key, toolchain_packager)
+                .and_then(|(dist_toolchain, maybe_dist_compile_executable)| {
+                    let mut tc_archive = None;
+                    if let Some((dist_compile_executable, archive_path)) = maybe_dist_compile_executable {
+                        dist_compile_cmd.executable = dist_compile_executable;
+                        tc_archive = Some(archive_path);
+                    }
+                    Ok((dist_client, dist_compile_cmd, dist_toolchain, inputs_packager, outputs_rewriter, dist_output_paths, tc_archive))
+                })
+        })
+        .and_then(move |(dist_client, dist_compile_cmd, dist_toolchain, inputs_packager, outputs_rewriter, dist_output_paths, tc_archive)| {
+            debug!("[{}]: Requesting allocation", compile_out_pretty3);
+            dist_client.do_alloc_job(dist_toolchain.clone())
+                .and_then(move |jares| {
+                    let alloc = match jares {
+                        dist::AllocJobResult::Success { job_alloc, need_toolchain: true } => {
+                            debug!("[{}]: Sending toolchain {} for job {}",
+                                compile_out_pretty3, dist_toolchain.archive_id, job_alloc.job_id);
+                            Box::new(dist_client.do_submit_toolchain(job_alloc.clone(), dist_toolchain)
+                                .and_then(move |res| {
+                                    match res {
+                                        dist::SubmitToolchainResult::Success => Ok(job_alloc),
+                                        dist::SubmitToolchainResult::JobNotFound =>
+                                            bail!("Job {} not found on server", job_alloc.job_id),
+                                        dist::SubmitToolchainResult::CannotCache =>
+                                            bail!("Toolchain for job {} could not be cached by server", job_alloc.job_id),
+                                    }
+                                })
+                                .chain_err(|| "Could not submit toolchain"))
+                        },
+                        dist::AllocJobResult::Success { job_alloc, need_toolchain: false } =>
+                            f_ok(job_alloc),
+                        dist::AllocJobResult::Fail { msg } =>
+                            f_err(Error::from("Failed to allocate job").chain_err(|| msg)),
+                    };
+                    alloc
+                        .and_then(move |job_alloc| {
+                            let job_id = job_alloc.job_id;
+                            let server_id = job_alloc.server_id;
+                            debug!("[{}]: Running job", compile_out_pretty3);
+                            dist_client.do_run_job(job_alloc, dist_compile_cmd, dist_output_paths, inputs_packager)
+                                .map(move |res| ((job_id, server_id), res))
+                                .chain_err(move || format!("could not run distributed compilation job on {:?}", server_id))
+                        })
+                })
+                .and_then(move |((job_id, server_id), (jres, path_transformer))| {
+                    let jc = match jres {
+                        dist::RunJobResult::Complete(jc) => jc,
+                        dist::RunJobResult::JobNotFound => bail!("Job {} not found on server", job_id),
+                    };
+                    info!("fetched {:?}", jc.outputs.iter().map(|&(ref p, ref bs)| (p, bs.lens().to_string())).collect::<Vec<_>>());
+                    let mut output_paths: Vec<PathBuf> = vec![];
+                    macro_rules! try_or_cleanup {
+                        ($v:expr) => {{
+                            match $v {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    // Do our best to clear up. We may end up deleting a file that we just wrote over
+                                    // the top of, but it's better to clear up too much than too little
+                                    for local_path in output_paths.iter() {
+                                        if let Err(e) = fs::remove_file(local_path) {
+                                            if e.kind() != io::ErrorKind::NotFound {
+                                                warn!("{} while attempting to clear up {}", e, local_path.display())
+                                            }
+                                        }
+                                    }
+                                    return Err(e)
+                                },
+                            }
+                        }};
+                    }
+
+                    for (path, output_data) in jc.outputs {
+                        let len = output_data.lens().actual;
+                        let local_path = try_or_cleanup!(path_transformer.to_local(&path)
+                            .chain_err(|| format!("unable to transform output path {}", path)));
+                        output_paths.push(local_path);
+                        // Do this first so cleanup works correctly
+                        let local_path = output_paths.last().expect("nothing in vec after push");
+
+                        let mut file = try_or_cleanup!(File::create(&local_path)
+                            .chain_err(|| format!("Failed to create output file {}", local_path.display())));
+                        let count = try_or_cleanup!(io::copy(&mut output_data.into_reader(), &mut file)
+                            .chain_err(|| format!("Failed to write output to {}", local_path.display())));
+
+                        assert!(count == len);
+                    }
+                    let extra_inputs = match tc_archive {
+                        Some(p) => vec![p],
+                        None => vec![],
+                    };
+                    try_or_cleanup!(outputs_rewriter.handle_outputs(&path_transformer, &output_paths, &extra_inputs)
+                        .chain_err(|| "failed to rewrite outputs from compile"));
+                    Ok((DistType::Ok(server_id), jc.output.into()))
+                })
+        })
+        .or_else(move |e| {
+            let mut errmsg = e.to_string();
+            for cause in e.iter() {
+                errmsg.push_str(": ");
+                errmsg.push_str(&cause.to_string());
+            }
+            match e {
+                Error(ErrorKind::HttpClientError(_), _) => f_err(e),
+                Error(ErrorKind::Lru(lru_disk_cache::Error::FileTooLarge), _) => f_err(format!(
+                    "Could not cache dist toolchain for {:?} locally.
+                     Increase `toolchain_cache_size` or decrease the toolchain archive size.",
+                    local_executable2)),
+                _ => {
+                    warn!("[{}]: Could not perform distributed compile, falling back to local: {}", compile_out_pretty4, errmsg);
+                    Box::new(compile_cmd.execute(&creator).map(|o| (DistType::Error, o)))
+                }
+            }
+        })
+        .map(move |(dt, o)| (cacheable, dt, o))
+    )
+}
+
+impl<T: CommandCreatorSync> Clone for Box<dyn CompilerHasher<T>> {
+    fn clone(&self) -> Box<dyn CompilerHasher<T>> {
+        self.box_clone()
+    }
 }
 
 /// An interface to a compiler for actually invoking compilation.
-pub trait Compilation<T>
-    where T: CommandCreatorSync,
-{
-    /// Given information about a compiler command, execute the compiler.
-    fn compile(self: Box<Self>,
-               creator: &T,
-               cwd: &Path,
-               env_vars: &[(OsString, OsString)])
-               -> SFuture<(Cacheable, process::Output)>;
+pub trait Compilation {
+    /// Given information about a compiler command, generate a command that can
+    /// execute the compiler.
+    fn generate_compile_commands(
+        &self,
+        path_transformer: &mut dist::PathTransformer,
+        rewrite_includes_only: bool,
+    ) -> Result<(CompileCommand, Option<dist::CompileCommand>, Cacheable)>;
+
+    /// Create a function that will create the inputs used to perform a distributed compilation
+    #[cfg(feature = "dist-client")]
+    fn into_dist_packagers(
+        self: Box<Self>,
+        _path_transformer: dist::PathTransformer,
+    ) -> Result<DistPackagers>;
 
     /// Returns an iterator over the results of this compilation.
     ///
     /// Each item is a descriptive (and unique) name of the output paired with
     /// the path where it'll show up.
-    fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a Path)> + 'a>;
+    fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = (&'a str, &'a Path)> + 'a>;
+}
+
+#[cfg(feature = "dist-client")]
+pub trait OutputsRewriter {
+    /// Perform any post-compilation handling of outputs, given a Vec of the dist_path and local_path
+    fn handle_outputs(
+        self: Box<Self>,
+        path_transformer: &dist::PathTransformer,
+        output_paths: &[PathBuf],
+        extra_inputs: &[PathBuf],
+    ) -> Result<()>;
+}
+
+#[cfg(feature = "dist-client")]
+pub struct NoopOutputsRewriter;
+#[cfg(feature = "dist-client")]
+impl OutputsRewriter for NoopOutputsRewriter {
+    fn handle_outputs(
+        self: Box<Self>,
+        _path_transformer: &dist::PathTransformer,
+        _output_paths: &[PathBuf],
+        _extra_inputs: &[PathBuf],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Result of generating a hash from a compiler command.
-pub struct HashResult<T: CommandCreatorSync> {
+pub struct HashResult {
     /// The hash key of the inputs.
     pub key: String,
     /// An object to use for the actual compilation, if necessary.
-    pub compilation: Box<Compilation<T> + 'static>,
+    pub compilation: Box<dyn Compilation + 'static>,
+    /// A weak key that may be used to identify the toolchain
+    pub weak_toolchain_key: String,
 }
 
 /// Possible results of parsing compiler arguments.
 #[derive(Debug, PartialEq)]
-pub enum CompilerArguments<T>
-{
+pub enum CompilerArguments<T> {
     /// Commandline can be handled.
     Ok(T),
     /// Cannot cache this compilation.
-    CannotCache(&'static str),
+    CannotCache(&'static str, Option<String>),
     /// This commandline is not a compile.
     NotCompilation,
+}
+
+macro_rules! cannot_cache {
+    ($why:expr) => {
+        return CompilerArguments::CannotCache($why, None);
+    };
+    ($why:expr, $extra_info:expr) => {
+        return CompilerArguments::CannotCache($why, Some($extra_info));
+    };
+}
+
+macro_rules! try_or_cannot_cache {
+    ($arg:expr, $why:expr) => {{
+        match $arg {
+            Ok(arg) => arg,
+            Err(e) => cannot_cache!($why, e.to_string()),
+        }
+    }};
+}
+
+/// Specifics about distributed compilation.
+#[derive(Debug, PartialEq)]
+pub enum DistType {
+    /// Distribution was not enabled.
+    NoDist,
+    /// Distributed compile success.
+    Ok(dist::ServerId),
+    /// Distributed compile failed.
+    Error,
 }
 
 /// Specifics about cache misses.
@@ -361,7 +764,7 @@ pub enum CompileResult {
     ///
     /// The `CacheWriteFuture` will resolve when the result is finished
     /// being stored in the cache.
-    CacheMiss(MissType, Duration, SFuture<CacheWriteInfo>),
+    CacheMiss(MissType, DistType, Duration, SFuture<CacheWriteInfo>),
     /// Not in cache, but the compilation result was determined to be not cacheable.
     NotCacheable,
     /// Not in cache, but compilation failed.
@@ -377,19 +780,22 @@ pub enum ColorMode {
 }
 
 impl Default for ColorMode {
-    fn default() -> ColorMode { ColorMode::Auto }
+    fn default() -> ColorMode {
+        ColorMode::Auto
+    }
 }
-
 
 /// Can't derive(Debug) because of `CacheWriteFuture`.
 impl fmt::Debug for CompileResult {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            &CompileResult::Error => write!(f, "CompileResult::Error"),
-            &CompileResult::CacheHit(ref d) => write!(f, "CompileResult::CacheHit({:?})", d),
-            &CompileResult::CacheMiss(ref m, ref d, _) => write!(f, "CompileResult::CacheMiss({:?}, {:?}, _)", d, m),
-            &CompileResult::NotCacheable => write!(f, "CompileResult::NotCacheable"),
-            &CompileResult::CompileFailed => write!(f, "CompileResult::CompileFailed"),
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            CompileResult::Error => write!(f, "CompileResult::Error"),
+            CompileResult::CacheHit(ref d) => write!(f, "CompileResult::CacheHit({:?})", d),
+            CompileResult::CacheMiss(ref m, ref dt, ref d, _) => {
+                write!(f, "CompileResult::CacheMiss({:?}, {:?}, {:?}, _)", d, m, dt)
+            }
+            CompileResult::NotCacheable => write!(f, "CompileResult::NotCacheable"),
+            CompileResult::CompileFailed => write!(f, "CompileResult::CompileFailed"),
         }
     }
 }
@@ -400,7 +806,10 @@ impl PartialEq<CompileResult> for CompileResult {
         match (self, other) {
             (&CompileResult::Error, &CompileResult::Error) => true,
             (&CompileResult::CacheHit(_), &CompileResult::CacheHit(_)) => true,
-            (&CompileResult::CacheMiss(ref m, _, _), &CompileResult::CacheMiss(ref n, _, _)) => m == n,
+            (
+                &CompileResult::CacheMiss(ref m, ref dt, _, _),
+                &CompileResult::CacheMiss(ref n, ref dt2, _, _),
+            ) => m == n && dt == dt2,
             (&CompileResult::NotCacheable, &CompileResult::NotCacheable) => true,
             (&CompileResult::CompileFailed, &CompileResult::CompileFailed) => true,
             _ => false,
@@ -409,21 +818,18 @@ impl PartialEq<CompileResult> for CompileResult {
 }
 
 #[cfg(unix)]
-fn get_file_mode(path: &Path) -> Result<Option<u32>>
-{
+fn get_file_mode(file: &File) -> Result<Option<u32>> {
     use std::os::unix::fs::MetadataExt;
-    Ok(Some(fs::metadata(path)?.mode()))
+    Ok(Some(file.metadata()?.mode()))
 }
 
 #[cfg(windows)]
-fn get_file_mode(_path: &Path) -> Result<Option<u32>>
-{
+fn get_file_mode(_file: &File) -> Result<Option<u32>> {
     Ok(None)
 }
 
 #[cfg(unix)]
-fn set_file_mode(path: &Path, mode: u32) -> Result<()>
-{
+fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
     let p = Permissions::from_mode(mode);
@@ -432,8 +838,7 @@ fn set_file_mode(path: &Path, mode: u32) -> Result<()>
 }
 
 #[cfg(windows)]
-fn set_file_mode(_path: &Path, _mode: u32) -> Result<()>
-{
+fn set_file_mode(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -462,74 +867,161 @@ pub enum CacheControl {
 ///
 /// Note that when the `TempDir` is dropped it will delete all of its contents
 /// including the path returned.
-pub fn write_temp_file(pool: &CpuPool, path: &Path, contents: Vec<u8>)
-                       -> SFuture<(TempDir, PathBuf)> {
+pub fn write_temp_file(
+    pool: &CpuPool,
+    path: &Path,
+    contents: Vec<u8>,
+) -> SFuture<(TempDir, PathBuf)> {
     let path = path.to_owned();
     pool.spawn_fn(move || -> Result<_> {
-        let dir = TempDir::new("sccache")?;
+        let dir = tempfile::Builder::new().prefix("sccache").tempdir()?;
         let src = dir.path().join(path);
         let mut file = File::create(&src)?;
         file.write_all(&contents)?;
         Ok((dir, src))
-    }).chain_err(|| {
-        "failed to write temporary file"
     })
+    .chain_err(|| "failed to write temporary file")
 }
 
+
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
-fn detect_compiler<T>(creator: &T, executable: &Path, pool: &CpuPool)
-                      -> SFuture<Option<Box<Compiler<T>>>>
-    where T: CommandCreatorSync
+fn detect_compiler<T>(
+    creator: T,
+    executable: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    pool: &CpuPool,
+    dist_archive: Option<PathBuf>,
+) -> SFuture<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
+where
+    T: CommandCreatorSync,
 {
-    trace!("detect_compiler");
+    trace!("detect_compiler: {}", executable.display());
 
     // First, see if this looks like rustc.
     let filename = match executable.file_stem() {
         None => return f_err("could not determine compiler kind"),
         Some(f) => f,
     };
-    let is_rustc = if filename.to_string_lossy().to_lowercase() == "rustc" {
+    let rustc_vv = if filename.to_string_lossy().to_lowercase() == "rustc" {
         // Sanity check that it's really rustc.
         let executable = executable.to_path_buf();
-        let child = creator.clone().new_command_sync(&executable)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .args(&["--version"])
-            .spawn();
-        let output = child.and_then(move |child| {
-            child.wait_with_output()
-                .chain_err(|| "failed to read child output")
-        });
-        Box::new(output.map(|output| {
-            if output.status.success() {
-                if let Ok(stdout) = String::from_utf8(output.stdout) {
-                    if stdout.starts_with("rustc ") {
-                        return true;
-                    }
+        let mut child = creator.clone().new_command_sync(executable);
+        child.env_clear().envs(ref_env(env)).args(&["-vV"]);
+
+        Box::new(run_input_output(child, None).map(|output| {
+            if let Ok(stdout) = String::from_utf8(output.stdout.clone()) {
+                if stdout.starts_with("rustc ") {
+                    return Some(Ok(stdout));
                 }
             }
-            false
+            Some(Err(ErrorKind::ProcessError(output)))
         }))
     } else {
-        f_ok(false)
+        f_ok(None)
     };
 
-    let creator = creator.clone();
+
+    let creator1 = creator.clone();
+    let creator2 = creator.clone();
     let executable = executable.to_owned();
+    let executable2 = executable.clone();
+    let env1 = env.to_owned();
+    let env2 = env.to_owned();
+    let env3 = env.to_owned();
     let pool = pool.clone();
-    Box::new(is_rustc.and_then(move |is_rustc| {
-        if is_rustc {
-            debug!("Found rustc");
-            Box::new(Rust::new(creator, executable, pool).map(|c| Some(Box::new(c) as Box<Compiler<T>>)))
-        } else {
-            detect_c_compiler(creator, executable, pool)
-        }
-    }))
+    let cwd = cwd.to_owned().clone();
+    Box::new(
+        rustc_vv
+            .and_then(move |rustc_vv| match rustc_vv {
+            Some(Ok(rustc_verbose_version)) => {
+                debug!("Found rustc");
+
+                Box::new(
+                    RustupProxy::find_proxy_executable::<T>(&executable2,"rustup", creator, &env1)
+                        .and_then(move |proxy : Result<Option<RustupProxy>>| -> SFuture<(Option<RustupProxy>, PathBuf)> {
+                            match proxy {
+                                Ok(Some(proxy)) => {
+                                    trace!("Found rustup proxy executable");
+                                    let fut =
+                                        proxy
+                                            .resolve_proxied_executable(creator1, cwd, &env2)
+                                            .then(move |res| {
+                                                // take the pathbuf for rustc as resolved by the proxy
+                                                match res {
+                                                    Ok((resolved_path, _time)) => {
+                                                        trace!("Resolved path with rustup proxy {:?}", &resolved_path);
+                                                        f_ok((Some(proxy), resolved_path))
+                                                    },
+                                                    Err(e) => {
+                                                        trace!("Could not resolve compiler with rustup proxy: {}", e);
+                                                        f_ok((None, executable))
+                                                    },
+                                                }
+                                            });
+                                    Box::new(fut)
+                                },
+                                Ok(None) => {
+                                    trace!("Did not find rustup");
+                                    f_ok((None, executable))
+                                },
+                                Err(e) => {
+                                    trace!("Did not find rustup due to {}", e);
+                                    f_ok((None, executable))
+                                },
+                            }
+                        })
+                        .then(move |res: Result<(Option<RustupProxy>, PathBuf)>| {
+                            let (proxy, resolved_rustc) : (_, PathBuf)
+                                = res
+                                    .map(|(proxy,resolved_compiler_executable)| {
+                                        (
+                                            proxy.map(Box::new).map(|x : Box<RustupProxy>| {
+                                                x as Box<dyn CompilerProxy<T>>
+                                            }),
+                                            resolved_compiler_executable
+                                        )
+                                    })
+                                    .unwrap_or_else(|_e| {
+                                        trace!("Compiling rust without proxy");
+                                        (None, executable2)
+                                    });
+
+                            Rust::new(
+                                creator2,
+                                resolved_rustc,
+                                &env3,
+                                &rustc_verbose_version,
+                                dist_archive,
+                                pool,
+                            )
+                            .map(|c| {
+                                (
+                                    Box::new(c) as Box<dyn Compiler<T> >,
+                                    proxy as Option<Box<dyn CompilerProxy<T>>>
+                                )
+                            })
+                    }
+                )
+            )
+            }
+            Some(Err(e)) => f_err(e),
+            None => {
+                let cc = detect_c_compiler(creator, executable, env1.to_vec(), pool);
+                Box::new(cc.map(|c : Box<dyn Compiler<T>>| { (c, None ) }))
+            },
+        })
+    )
 }
 
-fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
-                        -> SFuture<Option<Box<Compiler<T>>>>
-    where T: CommandCreatorSync
+fn detect_c_compiler<T>(
+    creator: T,
+    executable: PathBuf,
+    env: Vec<(OsString, OsString)>,
+    pool: CpuPool,
+) -> SFuture<Box<dyn Compiler<T>>>
+where
+    T: CommandCreatorSync,
 {
     trace!("detect_c_compiler");
 
@@ -555,7 +1047,9 @@ fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
     }
 
     // Otherwise, check if compiler is one of MSVC / Clang / GCC
-    let test = b"#if defined(_MSC_VER)
+    let test = b"#if defined(_MSC_VER) && defined(__clang__)
+msvc-clang
+#elif defined(_MSC_VER)
 msvc
 #elif defined(__clang__)
 clang
@@ -563,22 +1057,30 @@ clang
 gcc
 #elif defined(__HCC__)
 hcc
+#elif defined(__DCC__)
+diab
 #endif
-".to_vec();
+"
+    .to_vec();
     let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
 
     let mut cmd = creator.clone().new_command_sync(&executable);
     cmd.stdout(Stdio::piped())
-       .stderr(Stdio::null());
+        .stderr(Stdio::piped())
+        .envs(env.iter().map(|s| (&s.0, &s.1)));
     let output = write.and_then(move |(tempdir, src)| {
         cmd.arg("-E").arg(src);
         trace!("compiler {:?}", cmd);
-        cmd.spawn().and_then(|child| {
-            child.wait_with_output().chain_err(|| "failed to read child output")
-        }).map(|e| {
-            drop(tempdir);
-            e
-        })
+        cmd.spawn()
+            .and_then(|child| {
+                child
+                    .wait_with_output()
+                    .chain_err(|| "failed to read child output")
+            })
+            .map(|e| {
+                drop(tempdir);
+                e
+            })
     });
 
     Box::new(output.and_then(move |output| -> SFuture<_> {
@@ -588,76 +1090,116 @@ hcc
         };
         for line in stdout.lines() {
             //TODO: do something smarter here.
-            if line == "gcc" {
-                debug!("Found GCC");
-                return Box::new(CCompiler::new(GCC, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
-            } else if line == "clang" {
-                debug!("Found clang");
-                return Box::new(CCompiler::new(Clang, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
-            } else if line == "msvc" {
-                debug!("Found MSVC");
-                let prefix = msvc::detect_showincludes_prefix(&creator,
-                                                              executable.as_ref(),
-                                                              &pool);
-                return Box::new(prefix.and_then(move |prefix| {
-                    trace!("showIncludes prefix: '{}'", prefix);
-                    CCompiler::new(MSVC {
-                        includes_prefix: prefix,
-                    }, executable, &pool)
-                        .map(|c| Some(Box::new(c) as Box<Compiler<T>>))
-                }))
-            } else if line == "hcc" {
-                debug!("Found hcc");
-                return Box::new(CCompiler::new(HCC, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+            match line {
+                "clang" => {
+                    debug!("Found clang");
+                    return Box::new(
+                        CCompiler::new(Clang, executable, &pool)
+                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
+                    );
+                }
+                "diab" => {
+                    debug!("Found diab");
+                    return Box::new(
+                        CCompiler::new(Diab, executable, &pool)
+                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
+                    );
+                }
+                "gcc" => {
+                    debug!("Found GCC");
+                    return Box::new(
+                        CCompiler::new(GCC, executable, &pool)
+                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>),
+                    );
+                }
+                "msvc" | "msvc-clang" => {
+                    let is_clang = line == "msvc-clang";
+                    debug!("Found MSVC (is clang: {})", is_clang);
+                    let prefix = msvc::detect_showincludes_prefix(
+                        &creator,
+                        executable.as_ref(),
+                        is_clang,
+                        env,
+                        &pool,
+                    );
+                    return Box::new(prefix.and_then(move |prefix| {
+                        trace!("showIncludes prefix: '{}'", prefix);
+                        CCompiler::new(
+                            MSVC {
+                                includes_prefix: prefix,
+                                is_clang,
+                            },
+                            executable,
+                            &pool,
+                        )
+                        .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
+                    }));
+                }
+                "hcc" => {
+                    debug!("Found hcc");
+                    return Box::new(
+                        CCompiler::new(HCC, executable, &pool)
+                            .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
+                    );
+                }
+                _ => (),
             }
         }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
         debug!("nothing useful in detection output {:?}", stdout);
-        f_ok(None)
+        debug!("compiler status: {}", output.status);
+        debug!("compiler stderr:\n{}", stderr);
+
+        f_err(stderr.into_owned())
     }))
 }
 
 /// If `executable` is a known compiler, return a `Box<Compiler>` containing information about it.
-pub fn get_compiler_info<T>(creator: &T, executable: &Path, pool: &CpuPool)
-                            -> SFuture<Box<Compiler<T>>>
-    where T: CommandCreatorSync
+pub fn get_compiler_info<T>(
+    creator: T,
+    executable: &Path,
+    cwd: &Path,
+    env: &[(OsString, OsString)],
+    pool: &CpuPool,
+    dist_archive: Option<PathBuf>,
+) -> SFuture<(Box<dyn Compiler<T>>, Option<Box<dyn CompilerProxy<T>>>)>
+where
+    T: CommandCreatorSync,
 {
     let pool = pool.clone();
-    let detect = detect_compiler(creator, executable, &pool);
-    Box::new(detect.and_then(move |compiler| -> Result<_> {
-        match compiler {
-            Some(compiler) => Ok(compiler),
-            None => bail!("could not determine compiler kind"),
-        }
-    }))
+    detect_compiler(creator, executable, cwd, env, &pool, dist_archive)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use cache::Storage;
-    use cache::disk::DiskCache;
-    use futures::Future;
+    use crate::cache::disk::DiskCache;
+    use crate::cache::Storage;
+    use crate::mock_command::*;
+    use crate::test::mock_storage::MockStorage;
+    use crate::test::utils::*;
+    use futures::{future, Future};
     use futures_cpupool::CpuPool;
-    use mock_command::*;
-    use std::fs::{self,File};
+    use std::fs::{self, File};
     use std::io::Write;
     use std::sync::Arc;
     use std::time::Duration;
     use std::u64;
-    use test::mock_storage::MockStorage;
-    use test::utils::*;
-    use tokio_core::reactor::Core;
+    use tokio::runtime::current_thread::Runtime;
 
     #[test]
     fn test_detect_compiler_kind_gcc() {
         let f = TestFixture::new();
         let creator = new_creator();
         let pool = CpuPool::new(1);
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "foo\nbar\ngcc", "")));
-        let c = detect_compiler(&creator, &f.bins[0], &pool).wait().unwrap().unwrap();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "foo\nbar\ngcc", "")),
+        );
+        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
         assert_eq!(CompilerKind::C(CCompilerKind::GCC), c.kind());
     }
 
@@ -666,15 +1208,19 @@ mod test {
         let f = TestFixture::new();
         let creator = new_creator();
         let pool = CpuPool::new(1);
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "clang\nfoo", "")));
-        let c = detect_compiler(&creator, &f.bins[0], &pool).wait().unwrap().unwrap();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "clang\nfoo", "")),
+        );
+        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
         assert_eq!(CompilerKind::C(CCompilerKind::Clang), c.kind());
     }
 
     #[test]
     fn test_detect_compiler_kind_msvc() {
-        use env_logger;
-        drop(env_logger::init());
+        drop(env_logger::try_init());
         let creator = new_creator();
         let pool = CpuPool::new(1);
         let f = TestFixture::new();
@@ -686,10 +1232,18 @@ mod test {
         let prefix = String::from("blah: ");
         let stdout = format!("{}{}\r\n", prefix, s);
         // Compiler detection output
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "foo\nmsvc\nbar", "")));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "foo\nmsvc\nbar", "")),
+        );
         // showincludes prefix detection output
-        next_command(&creator, Ok(MockChild::new(exit_status(0), &stdout, &String::new())));
-        let c = detect_compiler(&creator, &f.bins[0], &pool).wait().unwrap().unwrap();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), &stdout, &String::new())),
+        );
+        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
         assert_eq!(CompilerKind::C(CCompilerKind::MSVC), c.kind());
     }
 
@@ -702,29 +1256,75 @@ mod test {
         let rustc = f.mk_bin("rustc").unwrap();
         let creator = new_creator();
         let pool = CpuPool::new(1);
-        // rustc --version
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "rustc 1.15 (blah 2017-01-01)", "")));
+        // rustc --vV
+        next_command(
+            &creator,
+            Ok(MockChild::new(
+                exit_status(0),
+                "\
+rustc 1.27.0 (3eda71b00 2018-06-19)
+binary: rustc
+commit-hash: 3eda71b00ad48d7bf4eef4c443e7f611fd061418
+commit-date: 2018-06-19
+host: x86_64-unknown-linux-gnu
+release: 1.27.0
+LLVM version: 6.0",
+                "",
+            )),
+        );
         // rustc --print=sysroot
         let sysroot = f.tempdir.path().to_str().unwrap();
         next_command(&creator, Ok(MockChild::new(exit_status(0), &sysroot, "")));
-        let c = detect_compiler(&creator, &rustc, &pool).wait().unwrap().unwrap();
+        next_command(&creator, Ok(MockChild::new(exit_status(0), &sysroot, "")));
+        next_command(&creator, Ok(MockChild::new(exit_status(0), &sysroot, "")));
+        let c = detect_compiler(creator, &rustc, f.tempdir.path(),&[], &pool, None)
+            .wait()
+            .unwrap().0;
         assert_eq!(CompilerKind::Rust, c.kind());
     }
 
     #[test]
-    fn test_detect_compiler_kind_unknown() {
+    fn test_detect_compiler_kind_diab() {
+        let f = TestFixture::new();
         let creator = new_creator();
         let pool = CpuPool::new(1);
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "something", "")));
-        assert!(detect_compiler(&creator, "/foo/bar".as_ref(), &pool).wait().unwrap().is_none());
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "foo\ndiab\nbar", "")),
+        );
+        let c = detect_compiler(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
+        assert_eq!(CompilerKind::C(CCompilerKind::Diab), c.kind());
+    }
+
+    #[test]
+    fn test_detect_compiler_kind_unknown() {
+        let f = TestFixture::new();
+        let creator = new_creator();
+        let pool = CpuPool::new(1);
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "something", "")),
+        );
+        assert!(
+            detect_compiler(creator, "/foo/bar".as_ref(),f.tempdir.path(), &[], &pool, None)
+                .wait()
+                .is_err()
+        );
     }
 
     #[test]
     fn test_detect_compiler_kind_process_fail() {
+        let f = TestFixture::new();
         let creator = new_creator();
         let pool = CpuPool::new(1);
         next_command(&creator, Ok(MockChild::new(exit_status(1), "", "")));
-        assert!(detect_compiler(&creator, "/foo/bar".as_ref(), &pool).wait().unwrap().is_none());
+        assert!(
+            detect_compiler(creator, "/foo/bar".as_ref(), f.tempdir.path(), &[], &pool, None)
+                .wait()
+                .is_err()
+        );
     }
 
     #[test]
@@ -734,63 +1334,75 @@ mod test {
         let f = TestFixture::new();
         // Pretend to be GCC.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
-        let c = get_compiler_info(&creator,
-                                  &f.bins[0],
-                                  &pool).wait().unwrap();
-        // sha-1 digest of an empty file.
+        let c = get_compiler_info(creator, &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
+        // digest of an empty file.
         assert_eq!(CompilerKind::C(CCompilerKind::GCC), c.kind());
     }
 
     #[test]
-    fn test_compiler_get_cached_or_compile_uncached() {
-        use env_logger;
-        drop(env_logger::init());
+    fn test_compiler_get_cached_or_compile() {
+        drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
-        let core = Core::new().unwrap();
-        let handle = core.handle();
-        let storage = DiskCache::new(&f.tempdir.path().join("cache"),
-                                     u64::MAX,
-                                     &pool);
-        let storage: Arc<Storage> = Arc::new(storage);
+        let mut runtime = Runtime::new().unwrap();
+        let storage = DiskCache::new(&f.tempdir.path().join("cache"), u64::MAX, &pool);
+        let storage: Arc<dyn Storage> = Arc::new(storage);
         // Pretend to be GCC.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
-        let c = get_compiler_info(&creator,
-                                  &f.bins[0],
-                                  &pool).wait().unwrap();
+        let c = get_compiler_info(creator.clone(), &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
         // The preprocessor invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "preprocessor output", "")));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
         // The compiler invocation.
-        const COMPILER_STDOUT : &'static [u8] = b"compiler stdout";
-        const COMPILER_STDERR : &'static [u8] = b"compiler stderr";
+        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
         let o = obj.clone();
         next_command_calls(&creator, move |_| {
             // Pretend to compile something.
             let mut f = File::create(&o)?;
             f.write_all(b"file contents")?;
-            Ok(MockChild::new(exit_status(0), COMPILER_STDOUT, COMPILER_STDERR))
+            Ok(MockChild::new(
+                exit_status(0),
+                COMPILER_STDOUT,
+                COMPILER_STDERR,
+            ))
         });
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
             CompilerArguments::Ok(h) => h,
-            o @ _ => panic!("Bad result from parse_arguments: {:?}", o),
+            o => panic!("Bad result from parse_arguments: {:?}", o),
         };
         let hasher2 = hasher.clone();
-        let (cached, res) = hasher.get_cached_or_compile(creator.clone(),
-                                                         storage.clone(),
-                                                         arguments.clone(),
-                                                         cwd.to_path_buf(),
-                                                         vec![],
-                                                         CacheControl::Default,
-                                                         pool.clone(),
-                                                         handle.clone()).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher.get_cached_or_compile(
+                    Ok(None),
+                    creator.clone(),
+                    storage.clone(),
+                    arguments.clone(),
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool.clone(),
+                )
+            }))
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -802,18 +1414,30 @@ mod test {
         // Now compile again, which should be a cache hit.
         fs::remove_file(&obj).unwrap();
         // The preprocessor invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "preprocessor output", "")));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
         // There should be no actual compiler invocation.
-        let (cached, res) = hasher2.get_cached_or_compile(creator.clone(),
-                                                          storage.clone(),
-                                                          arguments,
-                                                          cwd.to_path_buf(),
-                                                          vec![],
-                                                          CacheControl::Default,
-                                                          pool.clone(),
-                                                          handle).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher2.get_cached_or_compile(
+                    Ok(None),
+                    creator,
+                    storage,
+                    arguments,
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool,
+                )
+            }))
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -821,79 +1445,98 @@ mod test {
     }
 
     #[test]
-    fn test_compiler_get_cached_or_compile_cached() {
-        use env_logger;
-        drop(env_logger::init());
+    #[cfg(feature = "dist-client")]
+    fn test_compiler_get_cached_or_compile_dist() {
+        drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
-        let core = Core::new().unwrap();
-        let handle = core.handle();
-        let storage = DiskCache::new(&f.tempdir.path().join("cache"),
-                                     u64::MAX,
-                                     &pool);
-        let storage: Arc<Storage> = Arc::new(storage);
+        let mut runtime = Runtime::new().unwrap();
+        let storage = DiskCache::new(&f.tempdir.path().join("cache"), u64::MAX, &pool);
+        let storage: Arc<dyn Storage> = Arc::new(storage);
         // Pretend to be GCC.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
-        let c = get_compiler_info(&creator,
-                                  &f.bins[0],
-                                  &pool).wait().unwrap();
+        let c = get_compiler_info(creator.clone(), &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
         // The preprocessor invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "preprocessor output", "")));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
         // The compiler invocation.
-        const COMPILER_STDOUT : &'static [u8] = b"compiler stdout";
-        const COMPILER_STDERR : &'static [u8] = b"compiler stderr";
+        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
-        let o = obj.clone();
-        next_command_calls(&creator, move |_| {
-            // Pretend to compile something.
-            let mut f = File::create(&o)?;
-            f.write_all(b"file contents")?;
-            Ok(MockChild::new(exit_status(0), COMPILER_STDOUT, COMPILER_STDERR))
-        });
+        // Dist client will do the compilation
+        let dist_client = Some(test_dist::OneshotClient::new(
+            0,
+            COMPILER_STDOUT.to_owned(),
+            COMPILER_STDERR.to_owned(),
+        ));
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
             CompilerArguments::Ok(h) => h,
-            o @ _ => panic!("Bad result from parse_arguments: {:?}", o),
+            o => panic!("Bad result from parse_arguments: {:?}", o),
         };
         let hasher2 = hasher.clone();
-        let (cached, res) = hasher.get_cached_or_compile(creator.clone(),
-                                                         storage.clone(),
-                                                         arguments.clone(),
-                                                         cwd.to_path_buf(),
-                                                         vec![],
-                                                         CacheControl::Default,
-                                                         pool.clone(),
-                                                         handle.clone()).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher.get_cached_or_compile(
+                    Ok(dist_client.clone()),
+                    creator.clone(),
+                    storage.clone(),
+                    arguments.clone(),
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool.clone(),
+                )
+            }))
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, f) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
             _ => assert!(false, "Unexpected compile result: {:?}", cached),
         }
-
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         // Now compile again, which should be a cache hit.
         fs::remove_file(&obj).unwrap();
         // The preprocessor invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "preprocessor output", "")));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
         // There should be no actual compiler invocation.
-        let (cached, res) = hasher2.get_cached_or_compile(creator,
-                                                          storage,
-                                                          arguments,
-                                                          cwd.to_path_buf(),
-                                                          vec![],
-                                                          CacheControl::Default,
-                                                          pool,
-                                                          handle).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher2.get_cached_or_compile(
+                    Ok(dist_client.clone()),
+                    creator,
+                    storage,
+                    arguments,
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool,
+                )
+            }))
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
@@ -904,53 +1547,67 @@ mod test {
     /// Test that a cache read that results in an error is treated as a cache
     /// miss.
     fn test_compiler_get_cached_or_compile_cache_error() {
-        use env_logger;
-        drop(env_logger::init());
+        drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
-        let core = Core::new().unwrap();
-        let handle = core.handle();
+        let mut runtime = Runtime::new().unwrap();
         let storage = MockStorage::new();
         let storage: Arc<MockStorage> = Arc::new(storage);
         // Pretend to be GCC.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
-        let c = get_compiler_info(&creator,
-                                  &f.bins[0],
-                                  &pool).wait().unwrap();
+        let c = get_compiler_info(creator.clone(), &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
         // The preprocessor invocation.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "preprocessor output", "")));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
         // The compiler invocation.
-        const COMPILER_STDOUT : &'static [u8] = b"compiler stdout";
-        const COMPILER_STDERR : &'static [u8] = b"compiler stderr";
+        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         let obj = f.tempdir.path().join("foo.o");
         let o = obj.clone();
         next_command_calls(&creator, move |_| {
             // Pretend to compile something.
             let mut f = File::create(&o)?;
             f.write_all(b"file contents")?;
-            Ok(MockChild::new(exit_status(0), COMPILER_STDOUT, COMPILER_STDERR))
+            Ok(MockChild::new(
+                exit_status(0),
+                COMPILER_STDOUT,
+                COMPILER_STDERR,
+            ))
         });
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
             CompilerArguments::Ok(h) => h,
-            o @ _ => panic!("Bad result from parse_arguments: {:?}", o),
+            o => panic!("Bad result from parse_arguments: {:?}", o),
         };
         // The cache will return an error.
         storage.next_get(f_err("Some Error"));
-        let (cached, res) = hasher.get_cached_or_compile(creator.clone(),
-                                                         storage.clone(),
-                                                         arguments.clone(),
-                                                         cwd.to_path_buf(),
-                                                         vec![],
-                                                         CacheControl::Default,
-                                                         pool.clone(),
-                                                         handle.clone()).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher.get_cached_or_compile(
+                    Ok(None),
+                    creator,
+                    storage,
+                    arguments.clone(),
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool,
+                )
+            }))
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         match cached {
-            CompileResult::CacheMiss(MissType::CacheReadError, _, f) => {
+            CompileResult::CacheMiss(MissType::CacheReadError, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -964,58 +1621,70 @@ mod test {
 
     #[test]
     fn test_compiler_get_cached_or_compile_force_recache() {
-        use env_logger;
-        drop(env_logger::init());
+        drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
-        let core = Core::new().unwrap();
-        let handle = core.handle();
-        let storage = DiskCache::new(&f.tempdir.path().join("cache"),
-                                     u64::MAX,
-                                     &pool);
-        let storage: Arc<Storage> = Arc::new(storage);
+        let mut runtime = Runtime::new().unwrap();
+        let storage = DiskCache::new(&f.tempdir.path().join("cache"), u64::MAX, &pool);
+        let storage: Arc<dyn Storage> = Arc::new(storage);
         // Pretend to be GCC.
         next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
-        let c = get_compiler_info(&creator,
-                                  &f.bins[0],
-                                  &pool).wait().unwrap();
-        const COMPILER_STDOUT: &'static [u8] = b"compiler stdout";
-        const COMPILER_STDERR: &'static [u8] = b"compiler stderr";
+        let c = get_compiler_info(creator.clone(), &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
+        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+        const COMPILER_STDERR: &[u8] = b"compiler stderr";
         // The compiler should be invoked twice, since we're forcing
         // recaching.
         let obj = f.tempdir.path().join("foo.o");
         for _ in 0..2 {
             // The preprocessor invocation.
-            next_command(&creator, Ok(MockChild::new(exit_status(0), "preprocessor output", "")));
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
             // The compiler invocation.
             let o = obj.clone();
             next_command_calls(&creator, move |_| {
                 // Pretend to compile something.
                 let mut f = File::create(&o)?;
                 f.write_all(b"file contents")?;
-                Ok(MockChild::new(exit_status(0), COMPILER_STDOUT, COMPILER_STDERR))
+                Ok(MockChild::new(
+                    exit_status(0),
+                    COMPILER_STDOUT,
+                    COMPILER_STDERR,
+                ))
             });
         }
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
             CompilerArguments::Ok(h) => h,
-            o @ _ => panic!("Bad result from parse_arguments: {:?}", o),
+            o => panic!("Bad result from parse_arguments: {:?}", o),
         };
         let hasher2 = hasher.clone();
-        let (cached, res) = hasher.get_cached_or_compile(creator.clone(),
-                                                         storage.clone(),
-                                                         arguments.clone(),
-                                                         cwd.to_path_buf(),
-                                                         vec![],
-                                                         CacheControl::Default,
-                                                         pool.clone(),
-                                                         handle.clone()).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher.get_cached_or_compile(
+                    Ok(None),
+                    creator.clone(),
+                    storage.clone(),
+                    arguments.clone(),
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool.clone(),
+                )
+            }))
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -1026,18 +1695,26 @@ mod test {
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         // Now compile again, but force recaching.
         fs::remove_file(&obj).unwrap();
-        let (cached, res) = hasher2.get_cached_or_compile(creator,
-                                                          storage,
-                                                          arguments,
-                                                          cwd.to_path_buf(),
-                                                          vec![],
-                                                          CacheControl::ForceRecache,
-                                                          pool,
-                                                          handle).wait().unwrap();
+        let (cached, res) = hasher2
+            .get_cached_or_compile(
+                Ok(None),
+                creator,
+                storage,
+                arguments,
+                cwd.to_path_buf(),
+                vec![],
+                CacheControl::ForceRecache,
+                pool,
+            )
+            .wait()
+            .unwrap();
         // Ensure that the object file was created.
-        assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
+        assert_eq!(
+            true,
+            fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+        );
         match cached {
-            CompileResult::CacheMiss(MissType::ForcedRecache, _, f) => {
+            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, f) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -1050,43 +1727,489 @@ mod test {
 
     #[test]
     fn test_compiler_get_cached_or_compile_preprocessor_error() {
-        use env_logger;
-        drop(env_logger::init());
+        drop(env_logger::try_init());
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
-        let core = Core::new().unwrap();
-        let handle = core.handle();
-        let storage = DiskCache::new(&f.tempdir.path().join("cache"),
-                                     u64::MAX,
-                                     &pool);
-        let storage: Arc<Storage> = Arc::new(storage);
-        // Pretend to be GCC.
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
-        let c = get_compiler_info(&creator,
-                                  &f.bins[0],
-                                  &pool).wait().unwrap();
+        let mut runtime = Runtime::new().unwrap();
+        let storage = DiskCache::new(&f.tempdir.path().join("cache"), u64::MAX, &pool);
+        let storage: Arc<dyn Storage> = Arc::new(storage);
+        // Pretend to be GCC.  Also inject a fake object file that the subsequent
+        // preprocessor failure should remove.
+        let obj = f.tempdir.path().join("foo.o");
+        let o = obj.clone();
+        next_command_calls(&creator, move |_| {
+            let mut f = File::create(&o)?;
+            f.write_all(b"file contents")?;
+            Ok(MockChild::new(exit_status(0), "gcc", ""))
+        });
+        let c = get_compiler_info(creator.clone(), &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
+        // We should now have a fake object file.
+        assert_eq!(fs::metadata(&obj).is_ok(), true);
         // The preprocessor invocation.
-        const PREPROCESSOR_STDERR: &'static [u8] = b"something went wrong";
-        next_command(&creator, Ok(MockChild::new(exit_status(1), b"preprocessor output", PREPROCESSOR_STDERR)));
+        const PREPROCESSOR_STDERR: &[u8] = b"something went wrong";
+        next_command(
+            &creator,
+            Ok(MockChild::new(
+                exit_status(1),
+                b"preprocessor output",
+                PREPROCESSOR_STDERR,
+            )),
+        );
         let cwd = f.tempdir.path();
         let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
         let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
             CompilerArguments::Ok(h) => h,
-            o @ _ => panic!("Bad result from parse_arguments: {:?}", o),
+            o => panic!("Bad result from parse_arguments: {:?}", o),
         };
-        let (cached, res) = hasher.get_cached_or_compile(creator,
-                                                         storage,
-                                                         arguments,
-                                                         cwd.to_path_buf(),
-                                                         vec![],
-                                                         CacheControl::Default,
-                                                         pool,
-                                                         handle).wait().unwrap();
+        let (cached, res) = runtime
+            .block_on(future::lazy(|| {
+                hasher.get_cached_or_compile(
+                    Ok(None),
+                    creator,
+                    storage,
+                    arguments,
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::Default,
+                    pool,
+                )
+            }))
+            .unwrap();
         assert_eq!(cached, CompileResult::Error);
         assert_eq!(exit_status(1), res.status);
         // Shouldn't get anything on stdout, since that would just be preprocessor spew!
         assert_eq!(b"", res.stdout.as_slice());
         assert_eq!(PREPROCESSOR_STDERR, res.stderr.as_slice());
+        // Errors in preprocessing should remove the object file.
+        assert_eq!(fs::metadata(&obj).is_ok(), false);
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compiler_get_cached_or_compile_dist_error() {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let pool = CpuPool::new(1);
+        let dist_clients = vec![
+            test_dist::ErrorPutToolchainClient::new(),
+            test_dist::ErrorAllocJobClient::new(),
+            test_dist::ErrorSubmitToolchainClient::new(),
+            test_dist::ErrorRunJobClient::new(),
+        ];
+        let storage = DiskCache::new(&f.tempdir.path().join("cache"), u64::MAX, &pool);
+        let storage: Arc<dyn Storage> = Arc::new(storage);
+        // Pretend to be GCC.
+        next_command(&creator, Ok(MockChild::new(exit_status(0), "gcc", "")));
+        let c = get_compiler_info(creator.clone(), &f.bins[0], f.tempdir.path(), &[], &pool, None)
+            .wait()
+            .unwrap().0;
+        const COMPILER_STDOUT: &[u8] = b"compiler stdout";
+        const COMPILER_STDERR: &[u8] = b"compiler stderr";
+        // The compiler should be invoked twice, since we're forcing
+        // recaching.
+        let obj = f.tempdir.path().join("foo.o");
+        for _ in dist_clients.iter() {
+            // The preprocessor invocation.
+            next_command(
+                &creator,
+                Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+            );
+            // The compiler invocation.
+            let o = obj.clone();
+            next_command_calls(&creator, move |_| {
+                // Pretend to compile something.
+                let mut f = File::create(&o)?;
+                f.write_all(b"file contents")?;
+                Ok(MockChild::new(
+                    exit_status(0),
+                    COMPILER_STDOUT,
+                    COMPILER_STDERR,
+                ))
+            });
+        }
+        let cwd = f.tempdir.path();
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let hasher = match c.parse_arguments(&arguments, ".".as_ref()) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        // All these dist clients will fail, but should still result in successful compiles
+        for dist_client in dist_clients {
+            if obj.is_file() {
+                fs::remove_file(&obj).unwrap();
+            }
+            let hasher = hasher.clone();
+            let (cached, res) = hasher
+                .get_cached_or_compile(
+                    Ok(Some(dist_client.clone())),
+                    creator.clone(),
+                    storage.clone(),
+                    arguments.clone(),
+                    cwd.to_path_buf(),
+                    vec![],
+                    CacheControl::ForceRecache,
+                    pool.clone(),
+                )
+                .wait()
+                .unwrap();
+            // Ensure that the object file was created.
+            assert_eq!(
+                true,
+                fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap()
+            );
+            match cached {
+                CompileResult::CacheMiss(MissType::ForcedRecache, DistType::Error, _, f) => {
+                    // wait on cache write future so we don't race with it!
+                    f.wait().unwrap();
+                }
+                _ => assert!(false, "Unexpected compile result: {:?}", cached),
+            }
+            assert_eq!(exit_status(0), res.status);
+            assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
+            assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "dist-client")]
+mod test_dist {
+    use crate::dist::pkg;
+    use crate::dist::{
+        self, AllocJobResult, CompileCommand, JobAlloc, JobComplete, JobId, OutputData,
+        PathTransformer, ProcessOutput, RunJobResult, SchedulerStatusResult, ServerId,
+        SubmitToolchainResult, Toolchain,
+    };
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::errors::*;
+
+    pub struct ErrorPutToolchainClient;
+    impl ErrorPutToolchainClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new() -> Arc<dyn dist::Client> {
+            Arc::new(ErrorPutToolchainClient)
+        }
+    }
+    impl dist::Client for ErrorPutToolchainClient {
+        fn do_alloc_job(&self, _: Toolchain) -> SFuture<AllocJobResult> {
+            unreachable!()
+        }
+        fn do_get_status(&self) -> SFuture<SchedulerStatusResult> {
+            unreachable!()
+        }
+        fn do_submit_toolchain(&self, _: JobAlloc, _: Toolchain) -> SFuture<SubmitToolchainResult> {
+            unreachable!()
+        }
+        fn do_run_job(
+            &self,
+            _: JobAlloc,
+            _: CompileCommand,
+            _: Vec<String>,
+            _: Box<dyn pkg::InputsPackager>,
+        ) -> SFuture<(RunJobResult, PathTransformer)> {
+            unreachable!()
+        }
+        fn put_toolchain(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> SFuture<(Toolchain, Option<(String, PathBuf)>)> {
+            f_err("put toolchain failure")
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &PathBuf) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub struct ErrorAllocJobClient {
+        tc: Toolchain,
+    }
+    impl ErrorAllocJobClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new() -> Arc<dyn dist::Client> {
+            Arc::new(Self {
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+            })
+        }
+    }
+    impl dist::Client for ErrorAllocJobClient {
+        fn do_alloc_job(&self, tc: Toolchain) -> SFuture<AllocJobResult> {
+            assert_eq!(self.tc, tc);
+            f_err("alloc job failure")
+        }
+        fn do_get_status(&self) -> SFuture<SchedulerStatusResult> {
+            unreachable!()
+        }
+        fn do_submit_toolchain(&self, _: JobAlloc, _: Toolchain) -> SFuture<SubmitToolchainResult> {
+            unreachable!()
+        }
+        fn do_run_job(
+            &self,
+            _: JobAlloc,
+            _: CompileCommand,
+            _: Vec<String>,
+            _: Box<dyn pkg::InputsPackager>,
+        ) -> SFuture<(RunJobResult, PathTransformer)> {
+            unreachable!()
+        }
+        fn put_toolchain(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> SFuture<(Toolchain, Option<(String, PathBuf)>)> {
+            f_ok((self.tc.clone(), None))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &PathBuf) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub struct ErrorSubmitToolchainClient {
+        has_started: Cell<bool>,
+        tc: Toolchain,
+    }
+    impl ErrorSubmitToolchainClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new() -> Arc<dyn dist::Client> {
+            Arc::new(Self {
+                has_started: Cell::new(false),
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+            })
+        }
+    }
+    impl dist::Client for ErrorSubmitToolchainClient {
+        fn do_alloc_job(&self, tc: Toolchain) -> SFuture<AllocJobResult> {
+            assert!(!self.has_started.replace(true));
+            assert_eq!(self.tc, tc);
+            f_ok(AllocJobResult::Success {
+                job_alloc: JobAlloc {
+                    auth: "abcd".to_owned(),
+                    job_id: JobId(0),
+                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                },
+                need_toolchain: true,
+            })
+        }
+        fn do_get_status(&self) -> SFuture<SchedulerStatusResult> {
+            unreachable!()
+        }
+        fn do_submit_toolchain(
+            &self,
+            job_alloc: JobAlloc,
+            tc: Toolchain,
+        ) -> SFuture<SubmitToolchainResult> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(self.tc, tc);
+            f_err("submit toolchain failure")
+        }
+        fn do_run_job(
+            &self,
+            _: JobAlloc,
+            _: CompileCommand,
+            _: Vec<String>,
+            _: Box<dyn pkg::InputsPackager>,
+        ) -> SFuture<(RunJobResult, PathTransformer)> {
+            unreachable!()
+        }
+        fn put_toolchain(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> SFuture<(Toolchain, Option<(String, PathBuf)>)> {
+            f_ok((self.tc.clone(), None))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &PathBuf) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub struct ErrorRunJobClient {
+        has_started: Cell<bool>,
+        tc: Toolchain,
+    }
+    impl ErrorRunJobClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new() -> Arc<dyn dist::Client> {
+            Arc::new(Self {
+                has_started: Cell::new(false),
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+            })
+        }
+    }
+    impl dist::Client for ErrorRunJobClient {
+        fn do_alloc_job(&self, tc: Toolchain) -> SFuture<AllocJobResult> {
+            assert!(!self.has_started.replace(true));
+            assert_eq!(self.tc, tc);
+            f_ok(AllocJobResult::Success {
+                job_alloc: JobAlloc {
+                    auth: "abcd".to_owned(),
+                    job_id: JobId(0),
+                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                },
+                need_toolchain: true,
+            })
+        }
+        fn do_get_status(&self) -> SFuture<SchedulerStatusResult> {
+            unreachable!()
+        }
+        fn do_submit_toolchain(
+            &self,
+            job_alloc: JobAlloc,
+            tc: Toolchain,
+        ) -> SFuture<SubmitToolchainResult> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(self.tc, tc);
+            f_ok(SubmitToolchainResult::Success)
+        }
+        fn do_run_job(
+            &self,
+            job_alloc: JobAlloc,
+            command: CompileCommand,
+            _: Vec<String>,
+            _: Box<dyn pkg::InputsPackager>,
+        ) -> SFuture<(RunJobResult, PathTransformer)> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(command.executable, "/overridden/compiler");
+            f_err("run job failure")
+        }
+        fn put_toolchain(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> SFuture<(Toolchain, Option<(String, PathBuf)>)> {
+            f_ok((
+                self.tc.clone(),
+                Some((
+                    "/overridden/compiler".to_owned(),
+                    PathBuf::from("somearchiveid"),
+                )),
+            ))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &PathBuf) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub struct OneshotClient {
+        has_started: Cell<bool>,
+        tc: Toolchain,
+        output: ProcessOutput,
+    }
+
+    impl OneshotClient {
+        #[allow(clippy::new_ret_no_self)]
+        pub fn new(code: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Arc<dyn dist::Client> {
+            Arc::new(Self {
+                has_started: Cell::new(false),
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+                output: ProcessOutput::fake_output(code, stdout, stderr),
+            })
+        }
+    }
+
+    impl dist::Client for OneshotClient {
+        fn do_alloc_job(&self, tc: Toolchain) -> SFuture<AllocJobResult> {
+            assert!(!self.has_started.replace(true));
+            assert_eq!(self.tc, tc);
+
+            f_ok(AllocJobResult::Success {
+                job_alloc: JobAlloc {
+                    auth: "abcd".to_owned(),
+                    job_id: JobId(0),
+                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                },
+                need_toolchain: true,
+            })
+        }
+        fn do_get_status(&self) -> SFuture<SchedulerStatusResult> {
+            unreachable!()
+        }
+        fn do_submit_toolchain(
+            &self,
+            job_alloc: JobAlloc,
+            tc: Toolchain,
+        ) -> SFuture<SubmitToolchainResult> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(self.tc, tc);
+
+            f_ok(SubmitToolchainResult::Success)
+        }
+        fn do_run_job(
+            &self,
+            job_alloc: JobAlloc,
+            command: CompileCommand,
+            outputs: Vec<String>,
+            inputs_packager: Box<dyn pkg::InputsPackager>,
+        ) -> SFuture<(RunJobResult, PathTransformer)> {
+            assert_eq!(job_alloc.job_id, JobId(0));
+            assert_eq!(command.executable, "/overridden/compiler");
+
+            let mut inputs = vec![];
+            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+            let outputs = outputs
+                .into_iter()
+                .map(|name| {
+                    let data = format!("some data in {}", name);
+                    let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
+                    (name, data)
+                })
+                .collect();
+            let result = RunJobResult::Complete(JobComplete {
+                output: self.output.clone(),
+                outputs,
+            });
+            f_ok((result, path_transformer))
+        }
+        fn put_toolchain(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> SFuture<(Toolchain, Option<(String, PathBuf)>)> {
+            f_ok((
+                self.tc.clone(),
+                Some((
+                    "/overridden/compiler".to_owned(),
+                    PathBuf::from("somearchiveid"),
+                )),
+            ))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn get_custom_toolchain(&self, _exe: &PathBuf) -> Option<PathBuf> {
+            None
+        }
     }
 }

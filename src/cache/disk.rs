@@ -12,21 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cache::{
-    Cache,
-    CacheRead,
-    CacheWrite,
-    Storage,
-};
+use crate::cache::{Cache, CacheRead, CacheWrite, Storage};
 use futures_cpupool::CpuPool;
-use lru_disk_cache::LruDiskCache;
 use lru_disk_cache::Error as LruError;
+use lru_disk_cache::LruDiskCache;
 use std::ffi::OsStr;
-use std::path::{Path,PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
-use errors::*;
+use crate::errors::*;
 
 /// A cache that stores entries at local disk paths.
 #[derive(Clone)]
@@ -39,12 +34,12 @@ pub struct DiskCache {
 
 impl DiskCache {
     /// Create a new `DiskCache` rooted at `root`, with `max_size` as the maximum cache size on-disk, in bytes.
-    pub fn new<T: AsRef<OsStr>>(root: &T,
-                                max_size: u64,
-                                pool: &CpuPool) -> DiskCache {
+    pub fn new<T: AsRef<OsStr>>(root: &T, max_size: u64, pool: &CpuPool) -> DiskCache {
         DiskCache {
             //TODO: change this function to return a Result
-            lru: Arc::new(Mutex::new(LruDiskCache::new(root, max_size).expect("Couldn't instantiate disk cache!"))),
+            lru: Arc::new(Mutex::new(
+                LruDiskCache::new(root, max_size).expect("Couldn't instantiate disk cache!"),
+            )),
             pool: pool.clone(),
         }
     }
@@ -73,7 +68,7 @@ impl Storage for DiskCache {
                     trace!("DiskCache::get({}): IoError: {:?}", key, e);
                     return Err(e.into());
                 }
-                Err(_) => panic!("Unexpected error!"),
+                Err(_) => unreachable!(),
             };
             let hit = CacheRead::from(f)?;
             Ok(Cache::Hit(hit))
@@ -98,6 +93,10 @@ impl Storage for DiskCache {
         format!("Local disk: {:?}", self.lru.lock().unwrap().path())
     }
 
-    fn current_size(&self) -> Option<u64> { Some(self.lru.lock().unwrap().size()) }
-    fn max_size(&self) -> Option<u64> { Some(self.lru.lock().unwrap().capacity()) }
+    fn current_size(&self) -> SFuture<Option<u64>> {
+        f_ok(Some(self.lru.lock().unwrap().size()))
+    }
+    fn max_size(&self) -> SFuture<Option<u64>> {
+        f_ok(Some(self.lru.lock().unwrap().capacity()))
+    }
 }

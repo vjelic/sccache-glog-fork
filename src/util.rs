@@ -12,49 +12,69 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::Future;
+use crate::mock_command::{CommandChild, RunCommand};
+use blake3::Hasher as blake3_Hasher;
+use byteorder::{BigEndian, ByteOrder};
+use futures::{future, Future};
 use futures_cpupool::CpuPool;
-use mock_command::{CommandChild, RunCommand};
-use ring::digest::{SHA512, Context};
+use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::hash::Hasher;
-use std::io::BufReader;
 use std::io::prelude::*;
-use std::path::PathBuf;
-use std::process::{self,Stdio};
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::process::{self, Stdio};
+use std::time;
 use std::time::Duration;
 
-use errors::*;
+use crate::errors::*;
 
+#[derive(Clone)]
 pub struct Digest {
-    inner: Context,
+    inner: blake3_Hasher,
 }
 
 impl Digest {
     pub fn new() -> Digest {
-        Digest { inner: Context::new(&SHA512) }
+        Digest {
+            inner: blake3_Hasher::new(),
+        }
     }
 
-    /// Calculate the SHA-512 digest of the contents of `path`, running
+    /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
     pub fn file<T>(path: T, pool: &CpuPool) -> SFuture<String>
-        where T: Into<PathBuf>
+    where
+        T: AsRef<Path>,
     {
-        let path = path.into();
-        Box::new(pool.spawn_fn(move || -> Result<_> {
-            let f = File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
-            let mut m = Digest::new();
-            let mut reader = BufReader::new(f);
-            loop {
-                let mut buffer = [0; 1024];
-                let count = reader.read(&mut buffer[..])?;
-                if count == 0 {
-                    break;
-                }
-                m.update(&buffer[..count]);
+        Self::reader(path.as_ref().to_owned(), pool)
+    }
+
+    /// Calculate the BLAKE3 digest of the contents read from `reader`.
+    pub fn reader_sync<R: Read>(reader: R) -> Result<String> {
+        let mut m = Digest::new();
+        let mut reader = BufReader::new(reader);
+        loop {
+            // A buffer of 128KB should give us the best performance.
+            // See https://eklitzke.org/efficient-file-copying-on-linux.
+            let mut buffer = [0; 128 * 1024];
+            let count = reader.read(&mut buffer[..])?;
+            if count == 0 {
+                break;
             }
-            Ok(m.finish())
+            m.update(&buffer[..count]);
+        }
+        Ok(m.finish())
+    }
+
+    /// Calculate the BLAKE3 digest of the contents of `path`, running
+    /// the actual hash computation on a background thread in `pool`.
+    pub fn reader(path: PathBuf, pool: &CpuPool) -> SFuture<String> {
+        Box::new(pool.spawn_fn(move || -> Result<_> {
+            let reader = File::open(&path)
+                .chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
+            Digest::reader_sync(reader)
         }))
     }
 
@@ -63,52 +83,81 @@ impl Digest {
     }
 
     pub fn finish(self) -> String {
-        hex(self.inner.finish().as_ref())
+        hex(self.inner.finalize().as_bytes())
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+impl Default for Digest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
         s.push(hex(byte & 0xf));
-        s.push(hex((byte >> 4)& 0xf));
+        s.push(hex((byte >> 4) & 0xf));
     }
     return s;
 
     fn hex(byte: u8) -> char {
         match byte {
-            0...9 => (b'0' + byte) as char,
+            0..=9 => (b'0' + byte) as char,
             _ => (b'a' + byte - 10) as char,
         }
     }
 }
 
+/// Calculate the digest of each file in `files` on background threads in
+/// `pool`.
+pub fn hash_all(files: &[PathBuf], pool: &CpuPool) -> SFuture<Vec<String>> {
+    let start = time::Instant::now();
+    let count = files.len();
+    let pool = pool.clone();
+    Box::new(
+        future::join_all(
+            files
+                .iter()
+                .map(move |f| Digest::file(f, &pool))
+                .collect::<Vec<_>>(),
+        )
+        .map(move |hashes| {
+            trace!(
+                "Hashed {} files in {}",
+                count,
+                fmt_duration_as_secs(&start.elapsed())
+            );
+            hashes
+        }),
+    )
+}
+
 /// Format `duration` as seconds with a fractional component.
-pub fn fmt_duration_as_secs(duration: &Duration) -> String
-{
-    format!("{}.{:03} s", duration.as_secs(), duration.subsec_nanos() / 1000_000)
+pub fn fmt_duration_as_secs(duration: &Duration) -> String {
+    format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
 }
 
 /// If `input`, write it to `child`'s stdin while also reading `child`'s stdout and stderr, then wait on `child` and return its status and output.
 ///
 /// This was lifted from `std::process::Child::wait_with_output` and modified
 /// to also write to stdin.
-fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>)
-                             -> SFuture<process::Output>
-    where T: CommandChild + 'static,
+fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>) -> SFuture<process::Output>
+where
+    T: CommandChild + 'static,
 {
-    use tokio_io::io::{write_all, read_to_end};
+    use tokio_io::io::{read_to_end, write_all};
     let stdin = input.and_then(|i| {
-        child.take_stdin().map(|stdin| {
-            write_all(stdin, i).chain_err(|| "failed to write stdin")
-        })
+        child
+            .take_stdin()
+            .map(|stdin| write_all(stdin, i).chain_err(|| "failed to write stdin"))
     });
-    let stdout = child.take_stdout().map(|io| {
-        read_to_end(io, Vec::new()).chain_err(|| "failed to read stdout")
-    });
-    let stderr = child.take_stderr().map(|io| {
-        read_to_end(io, Vec::new()).chain_err(|| "failed to read stderr")
-    });
+    let stdout = child
+        .take_stdout()
+        .map(|io| read_to_end(io, Vec::new()).chain_err(|| "failed to read stdout"));
+    let stderr = child
+        .take_stderr()
+        .map(|io| read_to_end(io, Vec::new()).chain_err(|| "failed to read stderr"));
 
     // Finish writing stdin before waiting, because waiting drops stdin.
     let status = Future::and_then(stdin, |io| {
@@ -120,7 +169,7 @@ fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>)
         let stdout = out.map(|p| p.1);
         let stderr = err.map(|p| p.1);
         process::Output {
-            status: status,
+            status,
             stdout: stdout.unwrap_or_default(),
             stderr: stderr.unwrap_or_default(),
         }
@@ -131,27 +180,45 @@ fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>)
 ///
 /// If the command returns a non-successful exit status, an error of `ErrorKind::ProcessError`
 /// will be returned containing the process output.
-pub fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>)
-                           -> SFuture<process::Output>
-    where C: RunCommand
+pub fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>) -> SFuture<process::Output>
+where
+    C: RunCommand,
 {
     let child = command
         .no_console()
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::inherit() })
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
 
-    Box::new(child
-             .and_then(|child| {
-                 wait_with_input_output(child, input).and_then(|output| {
-                     if output.status.success() {
-                         f_ok(output)
-                     } else {
-                         f_err(ErrorKind::ProcessError(output))
-                     }
-                 })
-             }))
+    Box::new(child.and_then(|child| {
+        wait_with_input_output(child, input).and_then(|output| {
+            if output.status.success() {
+                f_ok(output)
+            } else {
+                f_err(ErrorKind::ProcessError(output))
+            }
+        })
+    }))
+}
+
+/// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
+pub fn write_length_prefixed_bincode<W, S>(mut writer: W, data: S) -> Result<()>
+where
+    W: Write,
+    S: Serialize,
+{
+    let bytes = bincode::serialize(&data)?;
+    let mut len = [0; 4];
+    BigEndian::write_u32(&mut len, bytes.len() as u32);
+    writer.write_all(&len)?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(())
 }
 
 pub trait OsStrExt {
@@ -208,10 +275,10 @@ impl OsStrExt for OsStr {
             // u16 iterator we keep going, otherwise we've found a mismatch.
             if to_match < 0xd7ff {
                 if to_match != codepoint {
-                    return false
+                    return false;
                 }
             } else {
-                return false
+                return false;
             }
         }
 
@@ -231,7 +298,7 @@ impl OsStrExt for OsStr {
                 Some(ch) => ch,
                 None => {
                     let codepoints = u16s.collect::<Vec<_>>();
-                    return Some(OsString::from_wide(&codepoints))
+                    return Some(OsString::from_wide(&codepoints));
                 }
             };
 
@@ -240,10 +307,10 @@ impl OsStrExt for OsStr {
 
             if to_match < 0xd7ff {
                 if to_match != codepoint {
-                    return None
+                    return None;
                 }
             } else {
-                return None
+                return None;
             }
             u16s.next();
         }
@@ -270,10 +337,202 @@ impl<'a> Hasher for HashToDigest<'a> {
     }
 }
 
+/// Turns a slice of environment var tuples into the type expected by Command::envs.
+pub fn ref_env(env: &[(OsString, OsString)]) -> impl Iterator<Item = (&OsString, &OsString)> {
+    env.iter().map(|&(ref k, ref v)| (k, v))
+}
+
+#[cfg(feature = "hyperx")]
+pub use self::http_extension::{HeadersExt, RequestExt};
+
+#[cfg(feature = "hyperx")]
+mod http_extension {
+    use http::header::HeaderValue;
+    use std::fmt;
+
+    pub trait HeadersExt {
+        fn set<H>(&mut self, header: H)
+        where
+            H: hyperx::header::Header + fmt::Display;
+
+        fn get_hyperx<H>(&self) -> Option<H>
+        where
+            H: hyperx::header::Header;
+    }
+
+    impl HeadersExt for http::HeaderMap {
+        fn set<H>(&mut self, header: H)
+        where
+            H: hyperx::header::Header + fmt::Display,
+        {
+            self.insert(
+                H::header_name(),
+                HeaderValue::from_shared(header.to_string().into()).unwrap(),
+            );
+        }
+
+        fn get_hyperx<H>(&self) -> Option<H>
+        where
+            H: hyperx::header::Header,
+        {
+            http::HeaderMap::get(self, H::header_name())
+                .and_then(|header| H::parse_header(&header.as_bytes().into()).ok())
+        }
+    }
+
+    pub trait RequestExt {
+        fn set_header<H>(self, header: H) -> Self
+        where
+            H: hyperx::header::Header + fmt::Display;
+    }
+
+    impl RequestExt for http::request::Builder {
+        fn set_header<H>(mut self, header: H) -> Self
+        where
+            H: hyperx::header::Header + fmt::Display,
+        {
+            self.header(
+                H::header_name(),
+                HeaderValue::from_shared(header.to_string().into()).unwrap(),
+            );
+            self
+        }
+    }
+
+    impl RequestExt for http::response::Builder {
+        fn set_header<H>(mut self, header: H) -> Self
+        where
+            H: hyperx::header::Header + fmt::Display,
+        {
+            self.header(
+                H::header_name(),
+                HeaderValue::from_shared(header.to_string().into()).unwrap(),
+            );
+            self
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    impl RequestExt for ::reqwest::r#async::RequestBuilder {
+        fn set_header<H>(self, header: H) -> Self
+        where
+            H: hyperx::header::Header + fmt::Display,
+        {
+            self.header(
+                H::header_name(),
+                HeaderValue::from_shared(header.to_string().into()).unwrap(),
+            )
+        }
+    }
+
+    #[cfg(feature = "reqwest")]
+    impl RequestExt for ::reqwest::RequestBuilder {
+        fn set_header<H>(self, header: H) -> Self
+        where
+            H: hyperx::header::Header + fmt::Display,
+        {
+            self.header(
+                H::header_name(),
+                HeaderValue::from_shared(header.to_string().into()).unwrap(),
+            )
+        }
+    }
+}
+
+/// Pipe `cmd`'s stdio to `/dev/null`, unless a specific env var is set.
+#[cfg(not(windows))]
+pub fn daemonize() -> Result<()> {
+    use daemonize::Daemonize;
+    use std::env;
+    use std::mem;
+
+    match env::var("SCCACHE_NO_DAEMON") {
+        Ok(ref val) if val == "1" => {}
+        _ => {
+            Daemonize::new()
+                .start()
+                .chain_err(|| "failed to daemonize")?;
+        }
+    }
+
+    static mut PREV_SIGSEGV: *mut libc::sigaction = 0 as *mut _;
+    static mut PREV_SIGBUS: *mut libc::sigaction = 0 as *mut _;
+    static mut PREV_SIGILL: *mut libc::sigaction = 0 as *mut _;
+
+    // We don't have a parent process any more once we've reached this point,
+    // which means that no one's probably listening for our exit status.
+    // In order to assist with debugging crashes of the server we configure our
+    // rlimit to allow runtime dumps and we also install a signal handler for
+    // segfaults which at least prints out what just happened.
+    unsafe {
+        match env::var("SCCACHE_ALLOW_CORE_DUMPS") {
+            Ok(ref val) if val == "1" => {
+                let rlim = libc::rlimit {
+                    rlim_cur: libc::RLIM_INFINITY,
+                    rlim_max: libc::RLIM_INFINITY,
+                };
+                libc::setrlimit(libc::RLIMIT_CORE, &rlim);
+            }
+            _ => {}
+        }
+
+        PREV_SIGSEGV = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        PREV_SIGBUS = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        PREV_SIGILL = Box::into_raw(Box::new(mem::zeroed::<libc::sigaction>()));
+        let mut new: libc::sigaction = mem::zeroed();
+        new.sa_sigaction = handler as usize;
+        new.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigaction(libc::SIGSEGV, &new, &mut *PREV_SIGSEGV);
+        libc::sigaction(libc::SIGBUS, &new, &mut *PREV_SIGBUS);
+        libc::sigaction(libc::SIGILL, &new, &mut *PREV_SIGILL);
+    }
+
+    return Ok(());
+
+    extern "C" fn handler(
+        signum: libc::c_int,
+        _info: *mut libc::siginfo_t,
+        _ptr: *mut libc::c_void,
+    ) {
+        use std::fmt::{Result, Write};
+
+        struct Stderr;
+
+        impl Write for Stderr {
+            fn write_str(&mut self, s: &str) -> Result {
+                unsafe {
+                    let bytes = s.as_bytes();
+                    libc::write(libc::STDERR_FILENO, bytes.as_ptr() as *const _, bytes.len());
+                    Ok(())
+                }
+            }
+        }
+
+        unsafe {
+            let _ = writeln!(Stderr, "signal {} received", signum);
+
+            // Configure the old handler and then resume the program. This'll
+            // likely go on to create a runtime dump if one's configured to be
+            // created.
+            match signum {
+                libc::SIGBUS => libc::sigaction(signum, &*PREV_SIGBUS, std::ptr::null_mut()),
+                libc::SIGILL => libc::sigaction(signum, &*PREV_SIGILL, std::ptr::null_mut()),
+                _ => libc::sigaction(signum, &*PREV_SIGSEGV, std::ptr::null_mut()),
+            };
+        }
+    }
+}
+
+/// This is a no-op on Windows.
+#[cfg(windows)]
+pub fn daemonize() -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
     use super::OsStrExt;
+    use std::ffi::{OsStr, OsString};
 
     #[test]
     fn simple_starts_with() {

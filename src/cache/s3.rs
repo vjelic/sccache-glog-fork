@@ -12,28 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cache::{
-    Cache,
-    CacheRead,
-    CacheWrite,
-    Storage,
+use crate::cache::{Cache, CacheRead, CacheWrite, Storage};
+use crate::simples3::{
+    AutoRefreshingProvider, Bucket, ChainProvider, ProfileProvider, ProvideAwsCredentials, Ssl,
 };
+use directories::UserDirs;
+use futures::future;
 use futures::future::Future;
-use simples3::{
-    AutoRefreshingProvider,
-    Bucket,
-    ChainProvider,
-    ProfileProvider,
-    ProvideAwsCredentials,
-    Ssl,
-};
-use std::env;
 use std::io;
 use std::rc::Rc;
-use std::time::{Instant, Duration};
-use tokio_core::reactor::Handle;
+use std::time::{Duration, Instant};
 
-use errors::*;
+use crate::errors::*;
 
 /// A cache that stores entries in Amazon S3.
 pub struct S3Cache {
@@ -45,8 +35,10 @@ pub struct S3Cache {
 
 impl S3Cache {
     /// Create a new `S3Cache` storing data in `bucket`.
-    pub fn new(bucket: &str, endpoint: &str, handle: &Handle) -> Result<S3Cache> {
-        let home = env::home_dir().ok_or("Couldn't find home directory")?;
+    pub fn new(bucket: &str, endpoint: &str, use_ssl: bool) -> Result<S3Cache> {
+        let user_dirs = UserDirs::new().ok_or("Couldn't get user directories")?;
+        let home = user_dirs.home_dir();
+
         let profile_providers = vec![
             ProfileProvider::with_configuration(home.join(".aws").join("credentials"), "default"),
             //TODO: this is hacky, this is where our mac builders store their
@@ -54,13 +46,11 @@ impl S3Cache {
             // or make those builders put their credentials in ~/.aws/credentials
             ProfileProvider::with_configuration(home.join(".boto"), "Credentials"),
         ];
-        let provider = AutoRefreshingProvider::new(ChainProvider::with_profile_providers(profile_providers, handle));
-        //TODO: configurable SSL
-        let bucket = Rc::new(Bucket::new(bucket, endpoint, Ssl::No, handle)?);
-        Ok(S3Cache {
-            bucket: bucket,
-            provider: provider,
-        })
+        let provider =
+            AutoRefreshingProvider::new(ChainProvider::with_profile_providers(profile_providers));
+        let ssl_mode = if use_ssl { Ssl::Yes } else { Ssl::No };
+        let bucket = Rc::new(Bucket::new(bucket, endpoint, ssl_mode)?);
+        Ok(S3Cache { bucket, provider })
     }
 }
 
@@ -71,18 +61,31 @@ fn normalize_key(key: &str) -> String {
 impl Storage for S3Cache {
     fn get(&self, key: &str) -> SFuture<Cache> {
         let key = normalize_key(key);
-        Box::new(self.bucket.get(&key).then(|result| {
-            match result {
-                Ok(data) => {
-                    let hit = CacheRead::from(io::Cursor::new(data))?;
-                    Ok(Cache::Hit(hit))
-                }
-                Err(e) => {
-                    warn!("Got AWS error: {:?}", e);
-                    Ok(Cache::Miss)
-                }
+
+        let result_cb = |result| match result {
+            Ok(data) => {
+                let hit = CacheRead::from(io::Cursor::new(data))?;
+                Ok(Cache::Hit(hit))
             }
-        }))
+            Err(e) => {
+                warn!("Got AWS error: {:?}", e);
+                Ok(Cache::Miss)
+            }
+        };
+
+        let bucket = self.bucket.clone();
+        let response = self
+            .provider
+            .credentials()
+            .then(move |credentials| match credentials {
+                Ok(creds) => bucket.get(&key, Some(&creds)),
+                Err(e) => {
+                    debug!("Could not load AWS creds: {}", e);
+                    bucket.get(&key, None)
+                }
+            })
+            .then(result_cb);
+        Box::new(response)
     }
 
     fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
@@ -92,15 +95,16 @@ impl Storage for S3Cache {
             Ok(data) => data,
             Err(e) => return f_err(e),
         };
-        let credentials = self.provider.credentials().chain_err(|| {
-            "failed to get AWS credentials"
-        });
+        let credentials = self
+            .provider
+            .credentials()
+            .chain_err(|| "failed to get AWS credentials");
 
         let bucket = self.bucket.clone();
         let response = credentials.and_then(move |credentials| {
-            bucket.put(&key, data, &credentials).chain_err(|| {
-                "failed to put cache entry in s3"
-            })
+            bucket
+                .put(&key, data, &credentials)
+                .chain_err(|| "failed to put cache entry in s3")
         });
 
         Box::new(response.map(move |_| start.elapsed()))
@@ -110,6 +114,10 @@ impl Storage for S3Cache {
         format!("S3, bucket: {}", self.bucket)
     }
 
-    fn current_size(&self) -> Option<u64> { None }
-    fn max_size(&self) -> Option<u64> { None }
+    fn current_size(&self) -> SFuture<Option<u64>> {
+        Box::new(future::ok(None))
+    }
+    fn max_size(&self) -> SFuture<Option<u64>> {
+        Box::new(future::ok(None))
+    }
 }

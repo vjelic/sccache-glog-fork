@@ -12,38 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ::cache::disk::DiskCache;
-use ::client::{
-    connect_to_server,
-};
-use ::commands::{
-    do_compile,
-    request_shutdown,
-    request_stats,
-};
-use env_logger;
+use crate::cache::disk::DiskCache;
+use crate::client::connect_to_server;
+use crate::commands::{do_compile, request_shutdown, request_stats};
+use crate::jobserver::Client;
+use crate::mock_command::*;
+use crate::server::{DistClientContainer, SccacheServer, ServerMessage};
+use crate::test::utils::*;
 use futures::sync::oneshot::{self, Sender};
 use futures_cpupool::CpuPool;
-use jobserver::Client;
-use ::mock_command::*;
-use ::server::{
-    ServerMessage,
-    SccacheServer,
-};
 use std::fs::File;
-use std::io::{
-    Cursor,
-    Write,
-};
+use std::io::{Cursor, Write};
+#[cfg(not(target_os = "macos"))]
 use std::net::TcpListener;
 use std::path::Path;
+#[cfg(not(target_os = "macos"))]
 use std::process::Command;
-use std::sync::{Arc,Mutex,mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use std::u64;
-use test::utils::*;
-use tokio_core::reactor::Core;
+use tokio::runtime::current_thread::Runtime;
 
 /// Options for running the server in tests.
 #[derive(Default)]
@@ -62,32 +51,42 @@ struct ServerOptions {
 /// * An `Arc`-and-`Mutex`-wrapped `MockCommandCreator` which the server will
 ///   use for all process creation.
 /// * The `JoinHandle` for the server thread.
-fn run_server_thread<T>(cache_dir: &Path, options: T)
-                        -> (u16, Sender<ServerMessage>, Arc<Mutex<MockCommandCreator>>, thread::JoinHandle<()>)
-    where T: Into<Option<ServerOptions>> + Send + 'static
+fn run_server_thread<T>(
+    cache_dir: &Path,
+    options: T,
+) -> (
+    u16,
+    Sender<ServerMessage>,
+    Arc<Mutex<MockCommandCreator>>,
+    thread::JoinHandle<()>,
+)
+where
+    T: Into<Option<ServerOptions>> + Send + 'static,
 {
     let options = options.into();
     let cache_dir = cache_dir.to_path_buf();
 
-    let cache_size = options.as_ref()
-                            .and_then(|o| o.cache_size.as_ref())
-                            .map(|s| *s)
-                            .unwrap_or(u64::MAX);
-    let pool = CpuPool::new(1);
-    let storage = Arc::new(DiskCache::new(&cache_dir, cache_size, &pool));
-
+    let cache_size = options
+        .as_ref()
+        .and_then(|o| o.cache_size.as_ref())
+        .copied()
+        .unwrap_or(u64::MAX);
     // Create a server on a background thread, get some useful bits from it.
     let (tx, rx) = mpsc::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = thread::spawn(move || {
-        let core = Core::new().unwrap();
+        let pool = CpuPool::new(1);
+        let dist_client = DistClientContainer::new_disabled();
+        let storage = Arc::new(DiskCache::new(&cache_dir, cache_size, &pool));
+
+        let runtime = Runtime::new().unwrap();
         let client = unsafe { Client::new() };
-        let srv = SccacheServer::new(0, pool, core, client, storage).unwrap();
+        let srv = SccacheServer::new(0, pool, runtime, client, dist_client, storage).unwrap();
         let mut srv: SccacheServer<Arc<Mutex<MockCommandCreator>>> = srv;
         assert!(srv.port() > 0);
         if let Some(options) = options {
             if let Some(timeout) = options.idle_timeout {
-                 srv.set_idle_timeout(Duration::from_millis(timeout));
+                srv.set_idle_timeout(Duration::from_millis(timeout));
             }
         }
         let port = srv.port();
@@ -133,7 +132,13 @@ fn test_server_shutdown_no_idle() {
 fn test_server_idle_timeout() {
     let f = TestFixture::new();
     // Set a ridiculously low idle timeout.
-    let (_port, _sender, _storage, child) = run_server_thread(&f.tempdir.path(), ServerOptions { idle_timeout: Some(1), .. Default::default() });
+    let (_port, _sender, _storage, child) = run_server_thread(
+        &f.tempdir.path(),
+        ServerOptions {
+            idle_timeout: Some(1),
+            ..Default::default()
+        },
+    );
     // Don't connect to it.
     // Ensure that it shuts down.
     // It would be nice to have an explicit timeout here so we don't hang
@@ -173,24 +178,31 @@ fn test_server_unsupported_compiler() {
     let exe = &f.bins[0];
     let cmdline = vec!["-c".into(), "file.c".into(), "-o".into(), "file.o".into()];
     let cwd = f.tempdir.path();
+    // This creator shouldn't create any processes. It will assert if
+    // it tries to.
     let client_creator = new_creator();
-    const COMPILER_STDOUT: &'static [u8] = b"some stdout";
-    const COMPILER_STDERR: &'static [u8] = b"some stderr";
-    {
-        let mut c = client_creator.lock().unwrap();
-        // Actual client output.
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), COMPILER_STDOUT, COMPILER_STDERR)));
-    }
     let mut stdout = Cursor::new(Vec::new());
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
-    let mut core = Core::new().unwrap();
-    assert_eq!(0, do_compile(client_creator.clone(), &mut core, conn, exe, cmdline, cwd, path, vec![], &mut stdout, &mut stderr).unwrap());
+    let mut runtime = Runtime::new().unwrap();
+    let res = do_compile(
+        client_creator,
+        &mut runtime,
+        conn,
+        exe,
+        cmdline,
+        cwd,
+        path,
+        vec![],
+        &mut stdout,
+        &mut stderr,
+    );
+    match res {
+        Ok(_) => panic!("do_compile should have failed!"),
+        Err(e) => assert_eq!("Compiler not supported: \"error\"", e.to_string()),
+    }
     // Make sure we ran the mock processes.
     assert_eq!(0, server_creator.lock().unwrap().children.len());
-    assert_eq!(0, client_creator.lock().unwrap().children.len());
-    assert_eq!(COMPILER_STDOUT, &stdout.into_inner()[..]);
-    assert_eq!(COMPILER_STDERR, &stderr.into_inner()[..]);
     // Shut down the server.
     sender.send(ServerMessage::Shutdown).ok().unwrap();
     // Ensure that it shuts down.
@@ -199,24 +211,25 @@ fn test_server_unsupported_compiler() {
 
 #[test]
 fn test_server_compile() {
-    match env_logger::init() {
-        Ok(_) => {},
-        Err(_) => {},
-    }
+    let _ = env_logger::try_init();
     let f = TestFixture::new();
     let (port, sender, server_creator, child) = run_server_thread(&f.tempdir.path(), None);
     // Connect to the server.
-    const PREPROCESSOR_STDOUT : &'static [u8] = b"preprocessor stdout";
-    const PREPROCESSOR_STDERR : &'static [u8] = b"preprocessor stderr";
-    const STDOUT : &'static [u8] = b"some stdout";
-    const STDERR : &'static [u8] = b"some stderr";
+    const PREPROCESSOR_STDOUT: &[u8] = b"preprocessor stdout";
+    const PREPROCESSOR_STDERR: &[u8] = b"preprocessor stderr";
+    const STDOUT: &[u8] = b"some stdout";
+    const STDERR: &[u8] = b"some stderr";
     let conn = connect_to_server(port).unwrap();
     {
         let mut c = server_creator.lock().unwrap();
         // The server will check the compiler. Pretend it's GCC.
         c.next_command_spawns(Ok(MockChild::new(exit_status(0), "gcc", "")));
         // Preprocessor invocation.
-        c.next_command_spawns(Ok(MockChild::new(exit_status(0), PREPROCESSOR_STDOUT, PREPROCESSOR_STDERR)));
+        c.next_command_spawns(Ok(MockChild::new(
+            exit_status(0),
+            PREPROCESSOR_STDOUT,
+            PREPROCESSOR_STDERR,
+        )));
         // Compiler invocation.
         //TODO: wire up a way to get data written to stdin.
         let obj = f.tempdir.path().join("file.o");
@@ -238,8 +251,23 @@ fn test_server_compile() {
     let mut stdout = Cursor::new(Vec::new());
     let mut stderr = Cursor::new(Vec::new());
     let path = Some(f.paths);
-    let mut core = Core::new().unwrap();
-    assert_eq!(0, do_compile(client_creator.clone(), &mut core, conn, exe, cmdline, cwd, path, vec![], &mut stdout, &mut stderr).unwrap());
+    let mut runtime = Runtime::new().unwrap();
+    assert_eq!(
+        0,
+        do_compile(
+            client_creator,
+            &mut runtime,
+            conn,
+            exe,
+            cmdline,
+            cwd,
+            path,
+            vec![],
+            &mut stdout,
+            &mut stderr
+        )
+        .unwrap()
+    );
     // Make sure we ran the mock processes.
     assert_eq!(0, server_creator.lock().unwrap().children.len());
     assert_eq!(STDOUT, stdout.into_inner().as_slice());
@@ -251,18 +279,32 @@ fn test_server_compile() {
 }
 
 #[test]
+// test fails intermittently on macos:
+// https://github.com/mozilla/sccache/issues/234
+#[cfg(not(target_os = "macos"))]
 fn test_server_port_in_use() {
     // Bind an arbitrary free port.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let sccache = find_sccache_binary();
     let output = Command::new(&sccache)
         .arg("--start-server")
-        .env("SCCACHE_SERVER_PORT", listener.local_addr().unwrap().port().to_string())
+        .env(
+            "SCCACHE_SERVER_PORT",
+            listener.local_addr().unwrap().port().to_string(),
+        )
         .output()
         .unwrap();
     assert!(!output.status.success());
     let s = String::from_utf8_lossy(&output.stderr);
-    assert!(s.contains("Server startup failed:"),
-            "Output did not contain 'Failed to start server:':\n========\n{}\n========",
-            s);
+    // Windows times out when the port is already in use.
+    #[cfg(target_os = "windows")]
+    const MSG: &str = "Timed out waiting for server startup";
+    #[cfg(not(target_os = "windows"))]
+    const MSG: &str = "Server startup failed:";
+    assert!(
+        s.contains(MSG),
+        "Output did not contain '{}':\n========\n{}\n========",
+        MSG,
+        s
+    );
 }

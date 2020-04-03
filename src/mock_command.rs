@@ -45,32 +45,18 @@
 //! then create an `Arc<Mutex<MockCommandCreator>>` and safely provide
 //! `MockChild` outputs.
 
-#[cfg(unix)]
-use libc;
-use errors::*;
+use crate::errors::*;
+use crate::jobserver::{Acquired, Client};
 use futures::future::{self, Future};
-use jobserver::{Acquired, Client};
 use std::boxed::Box;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::Path;
-use std::process::{
-    Command,
-    ExitStatus,
-    Output,
-    Stdio,
-};
-use std::sync::{Arc,Mutex};
-use tokio_process::{
-    self,
-    ChildStderr,
-    ChildStdin,
-    ChildStdout,
-    CommandExt,
-};
-use tokio_core::reactor::Handle;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_process::{self, ChildStderr, ChildStdin, ChildStdout, CommandExt};
 
 /// A trait that provides a subset of the methods of `std::process::Child`.
 pub trait CommandChild {
@@ -88,9 +74,9 @@ pub trait CommandChild {
     /// Take the stderr object from the process, if available.
     fn take_stderr(&mut self) -> Option<Self::E>;
     /// Wait for the process to complete and return its exit status.
-    fn wait(self) -> Box<Future<Item = ExitStatus, Error = io::Error>>;
+    fn wait(self) -> Box<dyn Future<Item = ExitStatus, Error = io::Error>>;
     /// Wait for the process to complete and return its output.
-    fn wait_with_output(self) -> Box<Future<Item = Output, Error = io::Error>>;
+    fn wait_with_output(self) -> Box<dyn Future<Item = Output, Error = io::Error>>;
 }
 
 /// A trait that provides a subset of the methods of `std::process::Command`.
@@ -104,11 +90,15 @@ pub trait RunCommand: fmt::Debug {
     fn args<S: AsRef<OsStr>>(&mut self, args: &[S]) -> &mut Self;
     /// Insert or update an environment variable mapping.
     fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
-        where K: AsRef<OsStr>,
-              V: AsRef<OsStr>;
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>;
     /// Add or update multiple environment variable mappings.
     fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
-        where I: IntoIterator<Item=(K, V)>, K: AsRef<OsStr>, V: AsRef<OsStr>;
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>;
     /// Clears the entire environment map for the child process.
     fn env_clear(&mut self) -> &mut Self;
     /// Set the working directory of the process to `dir`.
@@ -135,7 +125,7 @@ pub trait CommandCreator {
     type Cmd: RunCommand;
 
     /// Create a new instance of this type.
-    fn new(handle: &Handle, client: &Client) -> Self;
+    fn new(client: &Client) -> Self;
     /// Create a new object that implements `RunCommand` that can be used
     /// to create a new process.
     fn new_command<S: AsRef<OsStr>>(&mut self, program: S) -> Self::Cmd;
@@ -145,7 +135,7 @@ pub trait CommandCreator {
 pub trait CommandCreatorSync: Clone + 'static {
     type Cmd: RunCommand;
 
-    fn new(handle: &Handle, client: &Client) -> Self;
+    fn new(client: &Client) -> Self;
 
     fn new_command_sync<S: AsRef<OsStr>>(&mut self, program: S) -> Self::Cmd;
 }
@@ -161,11 +151,17 @@ impl CommandChild for Child {
     type O = ChildStdout;
     type E = ChildStderr;
 
-    fn take_stdin(&mut self) -> Option<ChildStdin> { self.inner.stdin().take() }
-    fn take_stdout(&mut self) -> Option<ChildStdout> { self.inner.stdout().take() }
-    fn take_stderr(&mut self) -> Option<ChildStderr> { self.inner.stderr().take() }
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.inner.stdin().take()
+    }
+    fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.inner.stdout().take()
+    }
+    fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.inner.stderr().take()
+    }
 
-    fn wait(self) -> Box<Future<Item = ExitStatus, Error = io::Error>> {
+    fn wait(self) -> Box<dyn Future<Item = ExitStatus, Error = io::Error>> {
         let Child { inner, token } = self;
         Box::new(inner.map(|ret| {
             drop(token);
@@ -173,7 +169,7 @@ impl CommandChild for Child {
         }))
     }
 
-    fn wait_with_output(self) -> Box<Future<Item = Output, Error = io::Error>> {
+    fn wait_with_output(self) -> Box<dyn Future<Item = Output, Error = io::Error>> {
         let Child { inner, token } = self;
         Box::new(inner.wait_with_output().map(|ret| {
             drop(token);
@@ -184,18 +180,14 @@ impl CommandChild for Child {
 
 pub struct AsyncCommand {
     inner: Option<Command>,
-    handle: Handle,
     jobserver: Client,
 }
 
 impl AsyncCommand {
-    pub fn new<S: AsRef<OsStr>>(program: S,
-                                handle: Handle,
-                                jobserver: Client) -> AsyncCommand {
+    pub fn new<S: AsRef<OsStr>>(program: S, jobserver: Client) -> AsyncCommand {
         AsyncCommand {
             inner: Some(Command::new(program)),
-            handle: handle,
-            jobserver: jobserver,
+            jobserver,
         }
     }
 
@@ -217,20 +209,20 @@ impl RunCommand for AsyncCommand {
         self
     }
     fn env<K, V>(&mut self, key: K, val: V) -> &mut AsyncCommand
-        where K: AsRef<OsStr>,
-              V: AsRef<OsStr>,
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
     {
         self.inner().env(key, val);
         self
     }
     fn envs<I, K, V>(&mut self, vars: I) -> &mut Self
-        where I: IntoIterator<Item=(K, V)>, K: AsRef<OsStr>, V: AsRef<OsStr>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
     {
-        //TODO: when Command::envs stabilizes, use that:
-        // https://github.com/rust-lang/rust/issues/38526
-        for (k, v) in vars {
-            self.inner().env(k, v);
-        }
+        self.inner().envs(vars);
         self
     }
     fn env_clear(&mut self) -> &mut AsyncCommand {
@@ -273,18 +265,20 @@ impl RunCommand for AsyncCommand {
         inner.env_remove("MFLAGS");
         inner.env_remove("CARGO_MAKEFLAGS");
         self.jobserver.configure(&mut inner);
-        let handle = self.handle.clone();
         Box::new(self.jobserver.acquire().and_then(move |token| {
-            let child = inner.spawn_async(&handle).chain_err(|| {
-                format!("failed to spawn {:?}", inner)
-            })?;
-            Ok(Child { inner: child, token: token })
+            let child = inner
+                .spawn_async()
+                .chain_err(|| format!("failed to spawn {:?}", inner))?;
+            Ok(Child {
+                inner: child,
+                token,
+            })
         }))
     }
 }
 
 impl fmt::Debug for AsyncCommand {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }
@@ -292,7 +286,6 @@ impl fmt::Debug for AsyncCommand {
 /// Struct to use `RunCommand` with `std::process::Command`.
 #[derive(Clone)]
 pub struct ProcessCommandCreator {
-    handle: Handle,
     jobserver: Client,
 }
 
@@ -300,15 +293,14 @@ pub struct ProcessCommandCreator {
 impl CommandCreator for ProcessCommandCreator {
     type Cmd = AsyncCommand;
 
-    fn new(handle: &Handle, client: &Client) -> ProcessCommandCreator {
+    fn new(client: &Client) -> ProcessCommandCreator {
         ProcessCommandCreator {
-            handle: handle.clone(),
             jobserver: client.clone(),
         }
     }
 
     fn new_command<S: AsRef<OsStr>>(&mut self, program: S) -> AsyncCommand {
-        AsyncCommand::new(program, self.handle.clone(), self.jobserver.clone())
+        AsyncCommand::new(program, self.jobserver.clone())
     }
 }
 
@@ -316,8 +308,8 @@ impl CommandCreator for ProcessCommandCreator {
 impl CommandCreatorSync for ProcessCommandCreator {
     type Cmd = AsyncCommand;
 
-    fn new(handle: &Handle, client: &Client) -> ProcessCommandCreator {
-        CommandCreator::new(handle, client)
+    fn new(client: &Client) -> ProcessCommandCreator {
+        CommandCreator::new(client)
     }
 
     fn new_command_sync<S: AsRef<OsStr>>(&mut self, program: S) -> AsyncCommand {
@@ -327,20 +319,18 @@ impl CommandCreatorSync for ProcessCommandCreator {
 }
 
 #[cfg(unix)]
-pub type ExitStatusValue = libc::c_int;
-
+use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
-// DWORD
+use std::os::windows::process::ExitStatusExt;
+
+#[cfg(unix)]
+pub type ExitStatusValue = i32;
+#[cfg(windows)]
 pub type ExitStatusValue = u32;
 
 #[allow(dead_code)]
-struct InnerExitStatus(ExitStatusValue);
-
-/// Hack until `ExitStatus::from_raw()` is stable.
-#[allow(dead_code)]
-pub fn exit_status(v : ExitStatusValue) -> ExitStatus {
-    use std::mem::transmute;
-    unsafe { transmute(InnerExitStatus(v)) }
+pub fn exit_status(v: ExitStatusValue) -> ExitStatus {
+    ExitStatus::from_raw(v)
 }
 
 /// A struct that mocks `std::process::Child`.
@@ -362,9 +352,13 @@ pub struct MockChild {
 impl MockChild {
     /// Create a `MockChild` that will return the specified `status`, `stdout`, and `stderr` when waited upon.
     #[allow(dead_code)]
-    pub fn new<T: AsRef<[u8]>, U: AsRef<[u8]>>(status: ExitStatus, stdout: T, stderr: U) -> MockChild {
+    pub fn new<T: AsRef<[u8]>, U: AsRef<[u8]>>(
+        status: ExitStatus,
+        stdout: T,
+        stderr: U,
+    ) -> MockChild {
         MockChild {
-            stdin: Some(io::Cursor::new(vec!())),
+            stdin: Some(io::Cursor::new(vec![])),
             stdout: Some(io::Cursor::new(stdout.as_ref().to_vec())),
             stderr: Some(io::Cursor::new(stderr.as_ref().to_vec())),
             wait_result: Some(Ok(status)),
@@ -388,22 +382,32 @@ impl CommandChild for MockChild {
     type O = io::Cursor<Vec<u8>>;
     type E = io::Cursor<Vec<u8>>;
 
-    fn take_stdin(&mut self) -> Option<io::Cursor<Vec<u8>>> { self.stdin.take() }
-    fn take_stdout(&mut self) -> Option<io::Cursor<Vec<u8>>> { self.stdout.take() }
-    fn take_stderr(&mut self) -> Option<io::Cursor<Vec<u8>>> { self.stderr.take() }
+    fn take_stdin(&mut self) -> Option<io::Cursor<Vec<u8>>> {
+        self.stdin.take()
+    }
+    fn take_stdout(&mut self) -> Option<io::Cursor<Vec<u8>>> {
+        self.stdout.take()
+    }
+    fn take_stderr(&mut self) -> Option<io::Cursor<Vec<u8>>> {
+        self.stderr.take()
+    }
 
-    fn wait(mut self) -> Box<Future<Item = ExitStatus, Error = io::Error>> {
+    fn wait(mut self) -> Box<dyn Future<Item = ExitStatus, Error = io::Error>> {
         Box::new(future::result(self.wait_result.take().unwrap()))
     }
 
-
-    fn wait_with_output(self) -> Box<Future<Item = Output, Error = io::Error>> {
-        let MockChild { stdout, stderr, wait_result, .. } = self;
+    fn wait_with_output(self) -> Box<dyn Future<Item = Output, Error = io::Error>> {
+        let MockChild {
+            stdout,
+            stderr,
+            wait_result,
+            ..
+        } = self;
         let result = wait_result.unwrap().and_then(|status| {
             Ok(Output {
-                status: status,
-                stdout: stdout.map(|c| c.into_inner()).unwrap_or(vec!()),
-                stderr: stderr.map(|c| c.into_inner()).unwrap_or(vec!()),
+                status,
+                stdout: stdout.map(|c| c.into_inner()).unwrap_or_else(|| vec![]),
+                stderr: stderr.map(|c| c.into_inner()).unwrap_or_else(|| vec![]),
             })
         });
         Box::new(future::result(result))
@@ -412,11 +416,11 @@ impl CommandChild for MockChild {
 
 pub enum ChildOrCall {
     Child(Result<MockChild>),
-    Call(Box<Fn(&[OsString]) -> Result<MockChild> + Send>),
+    Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
 }
 
 impl fmt::Debug for ChildOrCall {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             ChildOrCall::Child(ref r) => write!(f, "ChildOrCall::Child({:?}", r),
             ChildOrCall::Call(_) => write!(f, "ChildOrCall::Call(...)"),
@@ -444,13 +448,17 @@ impl RunCommand for MockCommand {
         self
     }
     fn env<K, V>(&mut self, _key: K, _val: V) -> &mut MockCommand
-        where K: AsRef<OsStr>,
-              V: AsRef<OsStr>,
+    where
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
     {
         self
     }
     fn envs<I, K, V>(&mut self, _vars: I) -> &mut Self
-        where I: IntoIterator<Item=(K, V)>, K: AsRef<OsStr>, V: AsRef<OsStr>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
     {
         self
     }
@@ -485,7 +493,7 @@ impl RunCommand for MockCommand {
 #[allow(dead_code)]
 pub struct MockCommandCreator {
     /// Data to be used as the return value of `MockCommand::spawn`.
-    pub children : Vec<ChildOrCall>,
+    pub children: Vec<ChildOrCall>,
 }
 
 impl MockCommandCreator {
@@ -499,7 +507,8 @@ impl MockCommandCreator {
     /// arguments passed to the command.
     #[allow(dead_code)]
     pub fn next_command_calls<C>(&mut self, call: C)
-        where C: Fn(&[OsString]) -> Result<MockChild> + Send + 'static,
+    where
+        C: Fn(&[OsString]) -> Result<MockChild> + Send + 'static,
     {
         self.children.push(ChildOrCall::Call(Box::new(call)));
     }
@@ -508,14 +517,14 @@ impl MockCommandCreator {
 impl CommandCreator for MockCommandCreator {
     type Cmd = MockCommand;
 
-    fn new(_handle: &Handle, _client: &Client) -> MockCommandCreator {
+    fn new(_client: &Client) -> MockCommandCreator {
         MockCommandCreator {
             children: Vec::new(),
         }
     }
 
     fn new_command<S: AsRef<OsStr>>(&mut self, _program: S) -> MockCommand {
-        assert!(self.children.len() > 0, "Too many calls to MockCommandCreator::new_command, or not enough to MockCommandCreator::new_command_spawns!");
+        assert!(!self.children.is_empty(), "Too many calls to MockCommandCreator::new_command, or not enough to MockCommandCreator::new_command_spawns!");
         //TODO: assert value of program
         MockCommand {
             child: Some(self.children.remove(0)),
@@ -524,12 +533,13 @@ impl CommandCreator for MockCommandCreator {
     }
 }
 
+
 /// To simplify life for using a `CommandCreator` across multiple threads.
 impl<T: CommandCreator + 'static> CommandCreatorSync for Arc<Mutex<T>> {
     type Cmd = T::Cmd;
 
-    fn new(handle: &Handle, client: &Client) -> Arc<Mutex<T>> {
-        Arc::new(Mutex::new(T::new(handle, client)))
+    fn new(client: &Client) -> Arc<Mutex<T>> {
+        Arc::new(Mutex::new(T::new(client)))
     }
 
     fn new_command_sync<S: AsRef<OsStr>>(&mut self, program: S) -> T::Cmd {
@@ -540,51 +550,69 @@ impl<T: CommandCreator + 'static> CommandCreatorSync for Arc<Mutex<T>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::error::Error;
+    use crate::jobserver::Client;
+    use crate::test::utils::*;
+    use futures::Future;
     use std::ffi::OsStr;
     use std::io;
-    use jobserver::Client;
-    use futures::Future;
-    use std::process::{
-        ExitStatus,
-        Output,
-    };
-    use std::sync::{Arc,Mutex};
+    use std::process::{ExitStatus, Output};
+    use std::sync::{Arc, Mutex};
     use std::thread;
-    use test::utils::*;
-    use tokio_core::reactor::Core;
 
-    fn spawn_command<T : CommandCreator, S: AsRef<OsStr>>(creator : &mut T, program: S) -> Result<<<T as CommandCreator>::Cmd as RunCommand>::C> {
+    fn spawn_command<T: CommandCreator, S: AsRef<OsStr>>(
+        creator: &mut T,
+        program: S,
+    ) -> Result<<<T as CommandCreator>::Cmd as RunCommand>::C> {
         creator.new_command(program).spawn().wait()
     }
 
-    fn spawn_wait_command<T : CommandCreator, S: AsRef<OsStr>>(creator : &mut T, program: S) -> Result<ExitStatus> {
+    fn spawn_wait_command<T: CommandCreator, S: AsRef<OsStr>>(
+        creator: &mut T,
+        program: S,
+    ) -> Result<ExitStatus> {
         Ok(spawn_command(creator, program)?.wait().wait()?)
     }
 
-    fn spawn_output_command<T : CommandCreator, S: AsRef<OsStr>>(creator : &mut T, program: S) -> Result<Output> {
+    fn spawn_output_command<T: CommandCreator, S: AsRef<OsStr>>(
+        creator: &mut T,
+        program: S,
+    ) -> Result<Output> {
         Ok(spawn_command(creator, program)?.wait_with_output().wait()?)
     }
 
-    fn spawn_on_thread<T : CommandCreatorSync + Send + 'static>(mut t : T, really : bool) -> ExitStatus {
+    fn spawn_on_thread<T: CommandCreatorSync + Send + 'static>(
+        mut t: T,
+        really: bool,
+    ) -> ExitStatus {
         thread::spawn(move || {
             if really {
                 t.new_command_sync("foo")
-                    .spawn().wait().unwrap()
-                    .wait().wait().unwrap()
+                    .spawn()
+                    .wait()
+                    .unwrap()
+                    .wait()
+                    .wait()
+                    .unwrap()
             } else {
                 exit_status(1)
             }
-        }).join().unwrap()
+        })
+        .join()
+        .unwrap()
     }
 
     #[test]
     fn test_mock_command_wait() {
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let mut creator = MockCommandCreator::new(&core.handle(), &client);
+        let mut creator = MockCommandCreator::new(&client);
         creator.next_command_spawns(Ok(MockChild::new(exit_status(0), "hello", "error")));
-        assert_eq!(0, spawn_wait_command(&mut creator, "foo").unwrap().code().unwrap());
+        assert_eq!(
+            0,
+            spawn_wait_command(&mut creator, "foo")
+                .unwrap()
+                .code()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -592,64 +620,62 @@ mod test {
     fn test_unexpected_new_command() {
         // If next_command_spawns hasn't been called enough times,
         // new_command should panic.
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let mut creator = MockCommandCreator::new(&core.handle(), &client);
+        let mut creator = MockCommandCreator::new(&client);
         creator.new_command("foo").spawn().wait().unwrap();
     }
 
     #[test]
     fn test_mock_command_output() {
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let mut creator = MockCommandCreator::new(&core.handle(), &client);
+        let mut creator = MockCommandCreator::new(&client);
         creator.next_command_spawns(Ok(MockChild::new(exit_status(0), "hello", "error")));
         let output = spawn_output_command(&mut creator, "foo").unwrap();
         assert_eq!(0, output.status.code().unwrap());
-        assert_eq!("hello".as_bytes().to_vec(), output.stdout);
-        assert_eq!("error".as_bytes().to_vec(), output.stderr);
+        assert_eq!(b"hello".to_vec(), output.stdout);
+        assert_eq!(b"error".to_vec(), output.stderr);
     }
 
     #[test]
     fn test_mock_command_calls() {
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let mut creator = MockCommandCreator::new(&core.handle(), &client);
-        creator.next_command_calls(|_| {
-            Ok(MockChild::new(exit_status(0), "hello", "error"))
-        });
+        let mut creator = MockCommandCreator::new(&client);
+        creator.next_command_calls(|_| Ok(MockChild::new(exit_status(0), "hello", "error")));
         let output = spawn_output_command(&mut creator, "foo").unwrap();
         assert_eq!(0, output.status.code().unwrap());
-        assert_eq!("hello".as_bytes().to_vec(), output.stdout);
-        assert_eq!("error".as_bytes().to_vec(), output.stderr);
+        assert_eq!(b"hello".to_vec(), output.stdout);
+        assert_eq!(b"error".to_vec(), output.stderr);
     }
 
     #[test]
     fn test_mock_spawn_error() {
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let mut creator = MockCommandCreator::new(&core.handle(), &client);
+        let mut creator = MockCommandCreator::new(&client);
         creator.next_command_spawns(Err("error".into()));
         let e = spawn_command(&mut creator, "foo").err().unwrap();
-        assert_eq!("error", e.description());
+        assert_eq!("error", e.to_string());
     }
 
     #[test]
     fn test_mock_wait_error() {
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let mut creator = MockCommandCreator::new(&core.handle(), &client);
-        creator.next_command_spawns(Ok(MockChild::with_error(io::Error::new(io::ErrorKind::Other, "error"))));
+        let mut creator = MockCommandCreator::new(&client);
+        creator.next_command_spawns(Ok(MockChild::with_error(io::Error::new(
+            io::ErrorKind::Other,
+            "error",
+        ))));
         let e = spawn_wait_command(&mut creator, "foo").err().unwrap();
-        assert_eq!("error", e.description());
+        assert_eq!("error", e.to_string());
     }
 
     #[test]
     fn test_mock_command_sync() {
-        let core = Core::new().unwrap();
         let client = Client::new_num(1);
-        let creator = Arc::new(Mutex::new(MockCommandCreator::new(&core.handle(), &client)));
-        next_command(&creator, Ok(MockChild::new(exit_status(0), "hello", "error")));
-        assert_eq!(exit_status(0), spawn_on_thread(creator.clone(), true));
+        let creator = Arc::new(Mutex::new(MockCommandCreator::new(&client)));
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "hello", "error")),
+        );
+        assert_eq!(exit_status(0), spawn_on_thread(creator, true));
     }
 }

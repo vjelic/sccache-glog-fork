@@ -1,6 +1,6 @@
-use compiler::ColorMode;
+use crate::compiler::ColorMode;
+use crate::server::{DistInfo, ServerInfo};
 use std::ffi::OsString;
-use server::ServerInfo;
 
 /// A client request.
 #[derive(Serialize, Deserialize, Debug)]
@@ -9,6 +9,8 @@ pub enum Request {
     ZeroStats,
     /// Get server statistics.
     GetStats,
+    /// Get dist status.
+    DistStatus,
     /// Shut the server down gracefully.
     Shutdown,
     /// Execute a compile or fetch a cached compilation result.
@@ -21,9 +23,11 @@ pub enum Response {
     /// Response for `Request::Compile`.
     Compile(CompileResponse),
     /// Response for `Request::GetStats`, containing server statistics.
-    Stats(ServerInfo),
+    Stats(Box<ServerInfo>),
+    /// Response for `Request::DistStatus`, containing client info.
+    DistStatus(DistInfo),
     /// Response for `Request::Shutdown`, containing server statistics.
-    ShuttingDown(ServerInfo),
+    ShuttingDown(Box<ServerInfo>),
     /// Second response for `Request::Compile`, containing the results of the compilation.
     CompileFinished(CompileFinished),
 }
@@ -35,6 +39,8 @@ pub enum CompileResponse {
     CompileStarted,
     /// The server could not handle this compilation request.
     UnhandledCompile,
+    /// The compiler was not supported.
+    UnsupportedCompiler(OsString),
 }
 
 /// Information about a finished compile, either from cache or executed locally.
