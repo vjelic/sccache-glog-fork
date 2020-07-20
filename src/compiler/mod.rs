@@ -16,6 +16,7 @@
 mod args;
 mod c;
 mod clang;
+mod clanghip;
 mod compiler;
 mod gcc;
 mod nvcc;

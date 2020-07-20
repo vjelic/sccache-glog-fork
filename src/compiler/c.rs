@@ -124,6 +124,8 @@ pub enum CCompilerKind {
     GCC,
     /// clang
     Clang,
+    /// clang HIP
+    ClangHIP,
     /// Microsoft Visual C++
     MSVC,
     /// clang-cl

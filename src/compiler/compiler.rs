@@ -21,6 +21,7 @@ use compiler::msvc;
 use compiler::clangcl;
 use compiler::c::{CCompiler, CCompilerKind};
 use compiler::clang::Clang;
+use compiler::clanghip::ClangHIP;
 use compiler::gcc::GCC;
 use compiler::nvcc::NVCC;
 use compiler::hcc::HCC;
@@ -593,9 +594,17 @@ hcc
                 return Box::new(CCompiler::new(GCC, executable, &pool)
                                 .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
             } else if line == "clang" {
-                debug!("Found clang");
-                return Box::new(CCompiler::new(Clang, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+                // Use ClangHIP module for ROCm hipcc compilers
+                let hip_string = executable.clone().into_os_string().into_string().unwrap();
+                if hip_string.contains("hip") || hip_string.contains("rocm") {
+                    debug!("Found hip clang");
+                    return Box::new(CCompiler::new(ClangHIP, executable, &pool)
+                                    .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+                } else {
+                    debug!("Found clang");
+                    return Box::new(CCompiler::new(Clang, executable, &pool)
+                                    .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
+                }
             } else if line == "msvc" {
                 debug!("Found MSVC");
                 let prefix = msvc::detect_showincludes_prefix(&creator,
