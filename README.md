@@ -59,6 +59,7 @@ Table of Contents (ToC)
 
 * [Build Requirements](#build-requirements)
 * [Build](#build)
+* [Build using Dockerfile](#build-using-dockerfile)
 * [Installation](#installation)
 * [Usage](#usage)
 * [Storage Options](#storage-options)
@@ -91,6 +92,12 @@ bash ./scripts/travis-musl-openssl.sh
 > $ cargo build --release --target $TARGET --features=all
 
 Then, the built binary is at ./target/x86_64-unknown-linux-musl/release/sccache
+
+## Build using Dockerfile
+In the repo directory
+> $ docker build .
+
+Then, the build binary can be found inside the container at - /root/sccache/target/x86_64-unknown-linux-musl/release/sccache
 
 ## Installation
 
