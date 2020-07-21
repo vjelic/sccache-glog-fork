@@ -8,21 +8,8 @@ Try setting max concurrent `make` build jobs to `$(nproc) - 1`.
 
 ### 2. How do I build sccache that won't segfault with ASAN?
 
-Do the following steps:
-
-```
-sudo apt update
-sudo apt install musl-tools
-export DEPLOY=1
-export TARGET=x86_64-unknown-linux-musl
-export OPENSSL_DIR=$HOME/openssl-musl
-bash ./scripts/travis-musl-openssl.sh
-cargo build --release --target $TARGET --features=all
-
-Then, the built binary is at ./target/x86_64-unknown-linux-musl/release/sccache
-```
-
-Then, to check ASAN cleanness:
+Build the sccache binary as [Build](#build) section.
+Next ASAN cleanness:
 
 ```
 # Install clang
@@ -88,9 +75,22 @@ Sccache is a [Rust](https://www.rust-lang.org/) program. Building it requires `c
 
 We recommend you install Rust via [Rustup](https://rustup.rs/). The generated binaries can be built so that they are very portable, see [scripts/build-release.sh](scripts/build-release.sh). By default `sccache` supports a local disk cache. To build `sccache` with support for `S3` and/or `Redis` cache backends, add `--features=all` or select a specific feature by passing `s3`, `gcs`, and/or `redis`. Refer the [Cargo Documentation](http://doc.crates.io/manifest.html#the-features-section) for details.
 
+## Prerequiste
+```
+sudo apt update
+sudo apt install musl-tools
+export DEPLOY=1
+export TARGET=x86_64-unknown-linux-musl
+export OPENSSL_DIR=$HOME/openssl-musl
+bash ./scripts/travis-musl-openssl.sh
+
+```
+
 ## Build
 
-> $ cargo build [--features=all|redis|s3|gcs] [--release]
+> $ cargo build --release --target $TARGET --features=all
+
+Then, the built binary is at ./target/x86_64-unknown-linux-musl/release/sccache
 
 ## Installation
 
