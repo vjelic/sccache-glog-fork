@@ -49,7 +49,7 @@ impl CCompilerImpl for HCC {
                      env_vars: &[(OsString, OsString)])
                      -> SFuture<process::Output> where T: CommandCreatorSync
     {
-        gcc::preprocess(creator, executable, parsed_args, cwd, env_vars)
+        gcc::preprocess(creator, executable, parsed_args, cwd, env_vars, self.kind())
     }
 
     fn compile<T>(&self,
@@ -61,7 +61,7 @@ impl CCompilerImpl for HCC {
                   -> SFuture<(Cacheable, process::Output)>
         where T: CommandCreatorSync
     {
-        gcc::compile(creator, executable, parsed_args, cwd, env_vars)
+        gcc::compile(creator, executable, parsed_args, cwd, env_vars, self.kind())
     }
 }
 
